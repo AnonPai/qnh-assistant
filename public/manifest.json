@@ -1,0 +1,54 @@
+{
+  "manifest_version": 3,
+  "name": "牵牛花商品同步助手",
+  "version": "0.1.0",
+  "description": "在美团牵牛花后台之间导出与导入门店商品,含图片视频与配置。",
+  "minimum_chrome_version": "120",
+  "icons": {
+    "16": "icons/icon-16.png",
+    "32": "icons/icon-32.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  },
+  "action": {
+    "default_title": "牵牛花同步助手",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "32": "icons/icon-32.png"
+    }
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://e.dianping.com/*",
+        "https://*.meituan.com/*",
+        "https://*.dianping.com/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["injected.js"],
+      "matches": [
+        "https://e.dianping.com/*",
+        "https://*.meituan.com/*",
+        "https://*.dianping.com/*"
+      ]
+    }
+  ],
+  "permissions": ["storage", "scripting", "activeTab"],
+  "host_permissions": [
+    "https://e.dianping.com/*",
+    "https://*.meituan.com/*",
+    "https://*.dianping.com/*",
+    "https://*.meituan.net/*",
+    "http://*.meituan.net/*"
+  ]
+}

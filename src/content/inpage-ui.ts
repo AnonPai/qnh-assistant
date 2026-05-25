@@ -1,0 +1,755 @@
+/**
+ * 在牵牛花后台页面里注入 UI:
+ *   1. 在「门店商品列表」页的工具条里插入「📦 导出本店商品」按钮
+ *   2. 在「主档商品列表」页的工具条里插入「📥 导入商品」按钮
+ *   3. 点击按钮弹出「单页配置表单」(见 ./config-forms.ts)— 一张表填完所有选项,
+ *      不再用引导式的多步弹窗
+ *   4. 表单提交后启动任务,弹出右下角浮动进度面板;手动模式下每个商品写入前
+ *      会弹出 requestImportConfirm 让用户三选一(确认 / 跳过 / 取消整批)
+ *
+ * 设计要点:
+ * - MutationObserver 持续观察工具条,SPA 切路由后页面被重绘也能补回按钮
+ * - 用 data-qnh-* 标记防重复注入
+ * - 进度面板与确认弹窗用 Shadow DOM 包裹,样式与宿主页面隔离
+ */
+
+import { createLogger } from '@shared/logger';
+import type { ProgressEvent } from '@shared/messaging';
+import type { CategoryMapping } from '@shared/types';
+import {
+  cancelCurrent,
+  callInjected,
+  startExport,
+  startImport,
+  subscribeProgress,
+} from './index';
+import { openExportForm, openImportForm } from './config-forms';
+
+const log = createLogger('inpage');
+
+const BTN_EXPORT_TEXT = '📦 导出本店商品';
+const BTN_IMPORT_TEXT = '📥 导入商品';
+const MARK_EXPORT_BTN = 'qnh-export-btn';
+const MARK_IMPORT_BTN = 'qnh-import-btn';
+const MARK_PANEL = 'qnh-progress-panel';
+
+/**
+ * 路由收紧:导出按钮只在「门店商品列表」(store/spu-list)显示,导入按钮只在
+ * 「主档(租户)商品列表」(tenant/spu-list)显示。两个入口语义不同,放错页面
+ * 容易把"门店在售"和"租户主档"两套数据搞混。
+ */
+const TARGET_HOST = 'qnh.meituan.com';
+// 牵牛花 SPA 的入口路径有两套:正式入口是 /home.html,官方网站直链是 /(直接走 HashRouter)。
+// 两个路径都会跑同一份前端代码,按钮注入条件只看 hash 路由就够了。
+const TARGET_PATHS = ['/', '/home.html'];
+const EXPORT_HASH_PREFIX = '#/unifiedGoods/store/spu-list';
+const IMPORT_HASH_PREFIX = '#/unifiedGoods/tenant/spu-list';
+
+function isOnQnhSpa(): boolean {
+  return location.hostname === TARGET_HOST && TARGET_PATHS.includes(location.pathname);
+}
+function isExportRoute(): boolean {
+  return isOnQnhSpa() && location.hash.startsWith(EXPORT_HASH_PREFIX);
+}
+function isImportRoute(): boolean {
+  return isOnQnhSpa() && location.hash.startsWith(IMPORT_HASH_PREFIX);
+}
+
+/** 启动注入观察 */
+export function mountInPageUI() {
+  let scheduled = false;
+  const tryMount = () => {
+    if (scheduled) return;
+    scheduled = true;
+    requestAnimationFrame(() => {
+      scheduled = false;
+      injectExportButton();
+      injectImportButton();
+    });
+  };
+  tryMount();
+
+  const obs = new MutationObserver(tryMount);
+  obs.observe(document.documentElement, { subtree: true, childList: true });
+
+  // SPA hash 变更也补一次
+  window.addEventListener('hashchange', tryMount);
+  window.addEventListener('popstate', tryMount);
+}
+
+/** 注入导出按钮到「新增商品」按钮的左边 */
+function injectExportButton() {
+  if (!isExportRoute()) {
+    document.querySelector(`[data-qnh="${MARK_EXPORT_BTN}"]`)?.remove();
+    return;
+  }
+  if (document.querySelector(`[data-qnh="${MARK_EXPORT_BTN}"]`)) return;
+
+  const anchor = findAddProductButton();
+  if (!anchor) return;
+  const toolbar = anchor.parentElement;
+  if (!toolbar) return;
+
+  const wrapper = document.createElement(anchor.tagName.toLowerCase());
+  wrapper.className = anchor.className; // 复制 ant-space-item 等
+  wrapper.dataset.qnh = MARK_EXPORT_BTN;
+
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.textContent = BTN_EXPORT_TEXT;
+  btn.style.cssText = [
+    'display:inline-flex',
+    'align-items:center',
+    'gap:4px',
+    'height:32px',
+    'padding:0 14px',
+    'border:1px solid #faad14',
+    'background:#fff7e6',
+    'color:#d48806',
+    'border-radius:4px',
+    'font-size:13px',
+    'cursor:pointer',
+    'line-height:1',
+  ].join(';');
+  btn.addEventListener('mouseenter', () => (btn.style.background = '#ffe7ba'));
+  btn.addEventListener('mouseleave', () => (btn.style.background = '#fff7e6'));
+  btn.addEventListener('click', onExportClick);
+
+  wrapper.appendChild(btn);
+  toolbar.insertBefore(wrapper, anchor);
+  log.info('已注入导出按钮', { toolbarClass: toolbar.className });
+}
+
+/** 注入导入按钮到「新增商品」按钮的左边(仅主档列表) */
+function injectImportButton() {
+  if (!isImportRoute()) {
+    document.querySelector(`[data-qnh="${MARK_IMPORT_BTN}"]`)?.remove();
+    return;
+  }
+  if (document.querySelector(`[data-qnh="${MARK_IMPORT_BTN}"]`)) return;
+
+  const anchor = findAddProductButton();
+  if (!anchor) return;
+  const toolbar = anchor.parentElement;
+  if (!toolbar) return;
+
+  const wrapper = document.createElement(anchor.tagName.toLowerCase());
+  wrapper.className = anchor.className;
+  wrapper.dataset.qnh = MARK_IMPORT_BTN;
+
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.textContent = BTN_IMPORT_TEXT;
+  btn.style.cssText = [
+    'display:inline-flex',
+    'align-items:center',
+    'gap:4px',
+    'height:32px',
+    'padding:0 14px',
+    'border:1px solid #52c41a',
+    'background:#f6ffed',
+    'color:#389e0d',
+    'border-radius:4px',
+    'font-size:13px',
+    'cursor:pointer',
+    'line-height:1',
+  ].join(';');
+  btn.addEventListener('mouseenter', () => (btn.style.background = '#d9f7be'));
+  btn.addEventListener('mouseleave', () => (btn.style.background = '#f6ffed'));
+  btn.addEventListener('click', onImportClick);
+
+  wrapper.appendChild(btn);
+  toolbar.insertBefore(wrapper, anchor);
+  log.info('已注入导入按钮');
+}
+
+/**
+ * 找页面上的「新增商品」按钮所在的工具条 item。
+ *
+ * 牵牛花用的是定制 antd,实际结构是:
+ *   <div class="unifiedGoods-ant-space-item">新增商品</div>
+ * 所以不能只找 button,需要按文本匹配任意元素,优先匹配 space-item。
+ */
+function findAddProductButton(): HTMLElement | null {
+  const inSpace = Array.from(
+    document.querySelectorAll<HTMLElement>('[class*="ant-space-item"]'),
+  ).filter((el) => el.offsetParent !== null && (el.textContent || '').trim() === '新增商品');
+  if (inSpace.length > 0) return inSpace[0];
+
+  const all = document.querySelectorAll<HTMLElement>('div, span, button, a');
+  for (const el of all) {
+    if (el.children.length > 0) continue;
+    if ((el.textContent || '').trim() !== '新增商品') continue;
+    if (el.offsetParent === null) continue;
+    const item = el.closest<HTMLElement>('[class*="ant-space-item"]') ?? el;
+    return item;
+  }
+  return null;
+}
+
+/**
+ * 从页面筛选区读取「商品名称」输入框的当前值,作为导出表单的预填默认值。
+ * 找不到返回空,导出表单可让用户手动填。
+ */
+function readSpuNameFilterFromPage(): string {
+  const inputs = document.querySelectorAll<HTMLInputElement>('input');
+  for (const inp of inputs) {
+    if (inp.offsetParent === null) continue;
+    if ((inp.placeholder || '').includes('商品名称')) {
+      return (inp.value || '').trim();
+    }
+  }
+  const labels = document.querySelectorAll<HTMLElement>('label, div, span');
+  for (const el of labels) {
+    if (el.children.length > 0) continue;
+    const t = (el.textContent || '').trim().replace(/[::]\s*$/, '');
+    if (t !== '商品名称') continue;
+    if (el.offsetParent === null) continue;
+    let cur: HTMLElement | null = el;
+    for (let depth = 0; depth < 4 && cur; depth++) {
+      const inp = cur.parentElement?.querySelector<HTMLInputElement>('input');
+      if (inp && inp.offsetParent !== null) return (inp.value || '').trim();
+      cur = cur.parentElement;
+    }
+  }
+  return '';
+}
+
+/* ============================================================
+   导出按钮:打开单页表单 → 用户填完一次性提交
+   ============================================================ */
+
+async function onExportClick() {
+  const initialSpuNameKeyword = readSpuNameFilterFromPage();
+  const result = await openExportForm({
+    callInjected,
+    initialSpuNameKeyword,
+  });
+  if (!result) return; // 用户取消
+
+  // 「重新开始」需要先把目录里的旧进度文件清掉,免得 runExport 当成续传
+  if (result.startMode === 'overwrite') {
+    await clearStaleProgress(result.targetDir);
+  }
+
+  showPanel({
+    title: `导出 ${result.shop.shopName ?? result.shop.shopId} · 准备中`,
+    body: `目录:${result.targetDir.name}${result.includeImages ? '' : ' · 不下图片'}${
+      result.includeVideo ? ' · 含视频' : ''
+    }${result.spuNameKeyword ? ` · 商品名筛选「${result.spuNameKeyword}」` : ''}`,
+    tone: 'info',
+  });
+  startExport({
+    sourceShopId: result.shop.shopId,
+    sourceShopName: result.shop.shopName,
+    includeImages: result.includeImages,
+    includeVideo: result.includeVideo,
+    spuNameKeyword: result.spuNameKeyword ?? undefined,
+    targetDir: result.targetDir,
+  });
+}
+
+/* ============================================================
+   导入按钮:打开单页表单 → 用户填完一次性提交
+   ============================================================ */
+
+async function onImportClick() {
+  const result = await openImportForm();
+  if (!result) return;
+
+  showPanel({
+    title: `导入数据 · 准备中`,
+    body: `源目录:${result.sourceDir.name} · ${result.mode === 'full' ? '全量' : '增量'} · ${
+      result.confirmMode === 'auto' ? '自动' : '手动'
+    } · ${result.syncImages ? '同步图片' : '不同步图片'}${
+      result.frontCategoryMappingFile ? ` · 分类映射:${result.frontCategoryMappingFile.name}` : ''
+    }`,
+    tone: 'info',
+  });
+
+  const mapping: CategoryMapping = {};
+  startImport({
+    sourceDir: result.sourceDir,
+    mapping,
+    mode: result.mode,
+    confirmMode: result.confirmMode,
+    syncImages: result.syncImages,
+    frontCategoryMappingFile: result.frontCategoryMappingFile,
+    requestConfirm: result.confirmMode === 'manual' ? requestImportConfirm : undefined,
+  });
+}
+
+/**
+ * 「重新导出」/「覆盖」时,把目录里旧的 .qnh-progress.json / manifest.json 删掉,
+ * 这样 runExport 启动时就不会被认作续传任务。products / media 子目录里的旧文件
+ * 不强删 — runExport 写新 SPU 用相同文件名会覆盖,旧的没引用就当孤儿留着,
+ * 用户事后可以手动清理整个目录。
+ */
+async function clearStaleProgress(dir: FileSystemDirectoryHandle): Promise<void> {
+  for (const name of ['.qnh-progress.json', 'manifest.json']) {
+    try {
+      await dir.removeEntry(name);
+    } catch {
+      /* 不存在就忽略 */
+    }
+  }
+}
+
+/* ============================================================
+   外部入口:popup 发现自己拿不到用户手势时,回退到"在页面里打开入口"
+   ============================================================ */
+
+export function openInPageEntry(kind: 'export' | 'import') {
+  if (kind === 'export') {
+    void onExportClick();
+  } else {
+    void onImportClick();
+  }
+}
+
+/* ============================================================
+   浮动进度面板(Shadow DOM)
+   ============================================================ */
+
+interface PanelInit {
+  title: string;
+  body?: string;
+  tone?: 'info' | 'success' | 'error';
+}
+
+let shadowHost: HTMLDivElement | null = null;
+let shadow: ShadowRoot | null = null;
+let unsub: (() => void) | null = null;
+
+function ensurePanel(): ShadowRoot {
+  if (shadow) return shadow;
+  shadowHost = document.createElement('div');
+  shadowHost.dataset.qnh = MARK_PANEL;
+  shadowHost.style.cssText =
+    'all:initial;position:fixed;top:0;left:0;width:0;height:0;z-index:2147483647;';
+  document.documentElement.appendChild(shadowHost);
+  shadow = shadowHost.attachShadow({ mode: 'open' });
+  shadow.innerHTML = panelHTML();
+  bindPanelEvents(shadow);
+  return shadow;
+}
+
+function showPanel(init: PanelInit) {
+  const root = ensurePanel();
+  const titleEl = root.querySelector('.qnh-title') as HTMLElement;
+  const bodyEl = root.querySelector('.qnh-body') as HTMLElement;
+  const cardEl = root.querySelector('.qnh-card') as HTMLElement;
+
+  titleEl.textContent = init.title;
+  bodyEl.textContent = init.body ?? '';
+  cardEl.dataset.tone = init.tone ?? 'info';
+  cardEl.classList.remove('qnh-hidden');
+
+  // 新任务开启:清空日志列表
+  resetPanelLogs(root);
+
+  // 进度订阅
+  if (unsub) unsub();
+  unsub = subscribeProgress((e) => onProgress(root, e));
+}
+
+function onProgress(root: ShadowRoot, e: ProgressEvent) {
+  const titleEl = root.querySelector('.qnh-title') as HTMLElement;
+  const bodyEl = root.querySelector('.qnh-body') as HTMLElement;
+  const barEl = root.querySelector('.qnh-bar > div') as HTMLElement;
+  const cardEl = root.querySelector('.qnh-card') as HTMLElement;
+
+  if (e.kind === 'log') {
+    appendPanelLog(root, e);
+    return;
+  }
+
+  if (e.kind === 'export') {
+    const phaseLabel = {
+      list: '加载商品列表',
+      detail: '抓取商品详情',
+      media: '下载图片',
+      pack: '打包',
+    }[e.phase];
+    const pCur =
+      e.productCurrent ??
+      (e.phase === 'detail' || e.phase === 'list' ? e.current : 0);
+    const pTotal =
+      e.productTotal ??
+      (e.phase === 'detail' || e.phase === 'list' ? e.total : 0);
+    titleEl.textContent = `导出中 · ${phaseLabel}`;
+    bodyEl.textContent = `商品 ${pCur} / ${pTotal || '?'}${e.message ? ` · ${e.message}` : ''}`;
+    if (pTotal > 0) {
+      barEl.style.width = `${Math.min(100, (pCur / pTotal) * 100)}%`;
+    }
+    cardEl.dataset.tone = 'info';
+  } else if (e.kind === 'import') {
+    const phaseLabel = {
+      parse: '解析数据包',
+      media: '上传图片',
+      product: '创建/修改商品',
+    }[e.phase];
+    const pCur = e.productCurrent ?? (e.phase === 'product' ? e.current : 0);
+    const pTotal = e.productTotal ?? (e.phase === 'product' ? e.total : 0);
+    titleEl.textContent = `导入中 · ${phaseLabel}`;
+    bodyEl.textContent = `商品 ${pCur} / ${pTotal || '?'}${e.message ? ` · ${e.message}` : ''}`;
+    if (pTotal > 0) {
+      barEl.style.width = `${Math.min(100, (pCur / pTotal) * 100)}%`;
+    }
+    cardEl.dataset.tone = 'info';
+  } else if (e.kind === 'done') {
+    if ('fileName' in e.result) {
+      titleEl.textContent = '导出完成 ✓';
+      bodyEl.textContent = `已生成 ${e.result.fileName},请检查下载目录。`;
+    } else {
+      const r = e.result;
+      const failed = r.failed > 0;
+      titleEl.textContent = failed ? '导入完成(有失败)' : '导入完成 ✓';
+      const parts = [`共 ${r.total}`, `新建 ${r.succeeded}`];
+      if (r.updated > 0) parts.push(`修改 ${r.updated}`);
+      if (r.skipped > 0) parts.push(`跳过 ${r.skipped}`);
+      parts.push(`失败 ${r.failed}`);
+      let body = parts.join(' · ');
+      if (failed) {
+        const firstFail = r.items.find((x) => x.status === 'failed');
+        if (firstFail) {
+          body += `\n首个失败: ${firstFail.name}\n原因: ${firstFail.errorMessage ?? '(无)'}`;
+        }
+      }
+      bodyEl.textContent = body;
+      bodyEl.style.whiteSpace = 'pre-wrap';
+    }
+    barEl.style.width = '100%';
+    cardEl.dataset.tone = 'success';
+  } else if (e.kind === 'error') {
+    titleEl.textContent = '出错了';
+    bodyEl.textContent = e.message;
+    cardEl.dataset.tone = 'error';
+  }
+}
+
+/** 浮动进度面板的日志列表上限,超过会从头丢弃,避免大批量任务撑爆 DOM */
+const INPAGE_MAX_LOG_LINES = 50;
+
+function resetPanelLogs(root: ShadowRoot) {
+  const list = root.querySelector('.qnh-logs') as HTMLElement | null;
+  if (!list) return;
+  list.classList.add('qnh-hidden');
+  list.innerHTML = '<div class="qnh-logs__empty">等待商品处理…</div>';
+}
+
+function appendPanelLog(
+  root: ShadowRoot,
+  e: Extract<ProgressEvent, { kind: 'log' }>,
+) {
+  const list = root.querySelector('.qnh-logs') as HTMLElement | null;
+  if (!list) return;
+  if (list.classList.contains('qnh-hidden')) {
+    list.innerHTML = '';
+    list.classList.remove('qnh-hidden');
+  }
+  const row = document.createElement('div');
+  row.className = 'qnh-logrow';
+  row.dataset.level = e.level;
+  const idx = document.createElement('span');
+  idx.className = 'qnh-logrow__index';
+  idx.textContent = `${e.index}${e.total ? `/${e.total}` : ''}`;
+  const text = document.createElement('span');
+  text.className = 'qnh-logrow__text';
+  text.textContent = e.text;
+  text.title = e.text;
+  row.append(idx, text);
+  list.appendChild(row);
+
+  while (list.childElementCount > INPAGE_MAX_LOG_LINES) {
+    list.removeChild(list.firstElementChild!);
+  }
+
+  // 总是滚到底部,模仿安装器"当前正在处理 X"的体验
+  list.scrollTop = list.scrollHeight;
+}
+
+function bindPanelEvents(root: ShadowRoot) {
+  root.querySelector('.qnh-close')?.addEventListener('click', () => {
+    (root.querySelector('.qnh-card') as HTMLElement).classList.add('qnh-hidden');
+    if (unsub) {
+      unsub();
+      unsub = null;
+    }
+  });
+  root.querySelector('.qnh-cancel')?.addEventListener('click', () => {
+    cancelCurrent();
+  });
+}
+
+function panelHTML(): string {
+  return `
+    <style>
+      :host { all: initial; }
+      .qnh-card {
+        position: fixed;
+        right: 20px;
+        bottom: 20px;
+        width: 380px;
+        background: #fff;
+        border: 1px solid #e6e8eb;
+        border-radius: 8px;
+        box-shadow: 0 6px 24px rgba(0,0,0,0.12);
+        font: 13px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI",
+          "PingFang SC", "Microsoft YaHei", sans-serif;
+        color: #1f1f1f;
+        overflow: hidden;
+        display: flex; flex-direction: column;
+      }
+      .qnh-card.qnh-hidden { display: none; }
+      .qnh-card[data-tone="success"] { border-color: #b7eb8f; }
+      .qnh-card[data-tone="error"]   { border-color: #ffa39e; }
+
+      .qnh-head {
+        display: flex; align-items: center; justify-content: space-between;
+        padding: 8px 12px;
+        background: #fafbfc;
+        border-bottom: 1px solid #f0f1f2;
+      }
+      .qnh-title { font-weight: 600; font-size: 13px; }
+      .qnh-close {
+        all: unset; cursor: pointer; padding: 0 6px;
+        color: #999; font-size: 16px; line-height: 1;
+      }
+      .qnh-close:hover { color: #1f1f1f; }
+
+      .qnh-content { padding: 10px 12px 8px; }
+      .qnh-body { font-size: 12px; color: #555; min-height: 18px; word-break: break-all; }
+      .qnh-bar {
+        margin-top: 8px;
+        height: 6px;
+        background: #f0f3f7;
+        border-radius: 3px;
+        overflow: hidden;
+      }
+      .qnh-bar > div {
+        height: 100%;
+        width: 0%;
+        background: #1677ff;
+        transition: width .25s ease;
+      }
+      .qnh-card[data-tone="success"] .qnh-bar > div { background: #52c41a; }
+      .qnh-card[data-tone="error"]   .qnh-bar > div { background: #ff4d4f; }
+
+      .qnh-logs {
+        margin: 0 12px 8px;
+        height: calc(12 * 18px + 12px);
+        overflow-y: auto;
+        background: #fafbfc;
+        border: 1px solid #e6e8eb;
+        border-radius: 6px;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 11px;
+        line-height: 18px;
+        padding: 6px 0;
+      }
+      .qnh-logs.qnh-hidden { display: none; }
+      .qnh-logs__empty {
+        padding: 16px; text-align: center; color: #999;
+        font-family: inherit;
+      }
+      .qnh-logrow {
+        display: flex; align-items: baseline; gap: 6px;
+        padding: 1px 8px;
+      }
+      .qnh-logrow:hover { background: #eef2f7; }
+      .qnh-logrow__index {
+        flex: 0 0 auto; min-width: 40px; text-align: right;
+        color: #999; font-variant-numeric: tabular-nums;
+      }
+      .qnh-logrow__text {
+        flex: 1 1 auto; white-space: nowrap; overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .qnh-logrow[data-level="success"] .qnh-logrow__text { color: #237804; }
+      .qnh-logrow[data-level="info"]    .qnh-logrow__text { color: #1f1f1f; }
+      .qnh-logrow[data-level="warn"]    .qnh-logrow__text { color: #ad6800; }
+      .qnh-logrow[data-level="error"]   .qnh-logrow__text { color: #cf1322; }
+
+      .qnh-foot {
+        display: flex; justify-content: flex-end;
+        padding: 8px 12px;
+        border-top: 1px solid #f0f1f2;
+        gap: 8px;
+      }
+      .qnh-btn {
+        all: unset; cursor: pointer;
+        padding: 4px 10px; border-radius: 4px;
+        font-size: 12px; border: 1px solid #d9d9d9;
+      }
+      .qnh-btn:hover { background: #fafafa; }
+    </style>
+    <div class="qnh-card qnh-hidden" data-tone="info">
+      <div class="qnh-head">
+        <span class="qnh-title">导出</span>
+        <button class="qnh-close" title="关闭">×</button>
+      </div>
+      <div class="qnh-content">
+        <div class="qnh-body"></div>
+        <div class="qnh-bar"><div></div></div>
+      </div>
+      <div class="qnh-logs qnh-hidden">
+        <div class="qnh-logs__empty">等待商品处理…</div>
+      </div>
+      <div class="qnh-foot">
+        <button class="qnh-btn qnh-cancel">取消任务</button>
+      </div>
+    </div>
+  `;
+}
+
+/* ============================================================
+   手动导入确认弹窗
+   --------------------------------------------------------------
+   每个商品写入(create / update)前调用一次,用户三选一:
+     ✓ 确认本次写入
+     →   跳过本商品(继续下一个)
+     ✗ 取消整批导入
+   返回的 Promise 会被 runImport 的 (c.5) 步骤 await,直到用户做出选择。
+   ============================================================ */
+
+const MARK_CONFIRM = 'qnh-import-confirm';
+
+export function requestImportConfirm(info: {
+  productName: string;
+  productCurrent: number;
+  productTotal: number;
+  action: 'create' | 'update';
+}): Promise<import('./import').ConfirmDecision> {
+  return new Promise((resolve) => {
+    document.querySelector(`[data-qnh="${MARK_CONFIRM}"]`)?.remove();
+
+    const host = document.createElement('div');
+    host.dataset.qnh = MARK_CONFIRM;
+    host.style.cssText =
+      'all:initial;position:fixed;top:0;left:0;width:0;height:0;z-index:2147483647;';
+    document.documentElement.appendChild(host);
+    const root = host.attachShadow({ mode: 'open' });
+
+    const actionLabel = info.action === 'create' ? '新建' : '修改';
+    const actionColor = info.action === 'create' ? '#1677ff' : '#fa8c16';
+
+    root.innerHTML = `
+      <style>
+        :host { all: initial; }
+        .qnh-cf-card {
+          position: fixed;
+          right: 20px;
+          bottom: 240px;
+          width: 360px;
+          background: #fff;
+          border: 1px solid #e6e8eb;
+          border-radius: 8px;
+          box-shadow: 0 6px 24px rgba(0,0,0,0.16);
+          font: 13px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI",
+            "PingFang SC", "Microsoft YaHei", sans-serif;
+          color: #1f1f1f;
+          overflow: hidden;
+        }
+        .qnh-cf-head {
+          display: flex; align-items: center; justify-content: space-between;
+          padding: 8px 12px;
+          background: #fafbfc;
+          border-bottom: 1px solid #f0f1f2;
+        }
+        .qnh-cf-title {
+          font-weight: 600; font-size: 13px;
+          display: flex; align-items: center; gap: 6px;
+        }
+        .qnh-cf-tag {
+          display: inline-block;
+          padding: 1px 6px; border-radius: 3px;
+          font-size: 11px; line-height: 16px;
+          color: #fff; background: ${actionColor};
+        }
+        .qnh-cf-prog {
+          color: #888; font-size: 11px;
+        }
+        .qnh-cf-body {
+          padding: 12px; font-size: 13px;
+          word-break: break-all;
+          max-height: 88px; overflow: auto;
+        }
+        .qnh-cf-foot {
+          display: flex; justify-content: flex-end; gap: 8px;
+          padding: 8px 12px;
+          border-top: 1px solid #f0f1f2;
+          background: #fafbff;
+        }
+        .qnh-cf-btn {
+          all: unset; cursor: pointer;
+          padding: 5px 12px; border-radius: 4px;
+          font-size: 12px; border: 1px solid #d9d9d9;
+        }
+        .qnh-cf-btn:hover { background: #fafafa; }
+        .qnh-cf-btn.ok {
+          background: #52c41a; color: #fff; border-color: #52c41a;
+        }
+        .qnh-cf-btn.ok:hover { background: #73d13d; }
+        .qnh-cf-btn.skip {
+          background: #fff; color: #555;
+        }
+        .qnh-cf-btn.cancel {
+          background: #fff; color: #cf1322; border-color: #ffa39e;
+        }
+        .qnh-cf-btn.cancel:hover { background: #fff1f0; }
+        .qnh-cf-hint {
+          padding: 0 12px 8px; color: #999; font-size: 11px;
+        }
+      </style>
+      <div class="qnh-cf-card">
+        <div class="qnh-cf-head">
+          <div class="qnh-cf-title">
+            <span class="qnh-cf-tag">${actionLabel}</span>
+            <span>等待确认</span>
+          </div>
+          <div class="qnh-cf-prog">${info.productCurrent} / ${info.productTotal}</div>
+        </div>
+        <div class="qnh-cf-body" title=""></div>
+        <div class="qnh-cf-hint">点击「对号」才会${actionLabel}该商品</div>
+        <div class="qnh-cf-foot">
+          <button class="qnh-cf-btn cancel">✗ 取消整批</button>
+          <button class="qnh-cf-btn skip">→ 跳过</button>
+          <button class="qnh-cf-btn ok">✓ 确认${actionLabel}</button>
+        </div>
+      </div>
+    `;
+
+    // textContent 比 innerHTML 更安全,避免商品名里有 < > 时出问题
+    const body = root.querySelector('.qnh-cf-body') as HTMLElement;
+    body.textContent = info.productName;
+    body.title = info.productName;
+
+    const dispose = (decision: import('./import').ConfirmDecision) => {
+      host.remove();
+      cleanup();
+      resolve(decision);
+    };
+    root.querySelector('.qnh-cf-btn.ok')?.addEventListener('click', () => dispose('confirm'));
+    root.querySelector('.qnh-cf-btn.skip')?.addEventListener('click', () => dispose('skip'));
+    root
+      .querySelector('.qnh-cf-btn.cancel')
+      ?.addEventListener('click', () => dispose('cancel-all'));
+
+    // 键盘快捷键:Enter=确认 / S=跳过 / Esc=取消整批
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        dispose('confirm');
+      } else if (e.key === 'Escape') {
+        e.preventDefault();
+        dispose('cancel-all');
+      } else if (e.key === 's' || e.key === 'S') {
+        e.preventDefault();
+        dispose('skip');
+      }
+    };
+    const cleanup = () => window.removeEventListener('keydown', onKey, true);
+    window.addEventListener('keydown', onKey, true);
+  });
+}
