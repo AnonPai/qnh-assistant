@@ -1344,6 +1344,60 @@ function formatWeight3(s: string | number | undefined): string {
   return n.toFixed(3);
 }
 
+/**
+ * 构造 SKU 的「基础箱规」列表(cartonMeasureConvertFactorList)。
+ *
+ * 后端校验:**基础箱规单位名称必须与售卖单位(saleUnit)一致**,否则报
+ * "基础箱规单位必须和售卖单位名称一致"。之前这里恒为 `[]`,组合装(saleUnit 为空)
+ * 时不触发校验,但普通单品(如 saleUnit="袋")就会被拒。
+ *
+ * 策略:
+ *   - saleUnit 为空 → 沿用旧行为给空数组(组合装等场景);
+ *   - saleUnit 非空 → 复刻源端 detail 里的基础箱规(`basicUnitConvertFactor === 1` 那条),
+ *     并把它的 `cartonMeasureName` 强制对齐成 saleUnit;源端缺失时合成一条
+ *     `{ cartonMeasureName: saleUnit, basicUnitConvertFactor: 1, ... }`。
+ *   - 跨租户创建时不能透传源端的 `cartonMeasureCode`(那是源租户的 ID),置空让服务端分配。
+ */
+function buildCartonMeasureList(
+  direction: V2Direction,
+  s: RawTenantSku,
+  targetSku: RawTenantSku | undefined,
+  saleUnit: string,
+): unknown[] {
+  if (!saleUnit) return [];
+
+  const srcList = (s.cartonMeasureConvertFactorList ?? []) as Array<Record<string, unknown>>;
+  // 基础箱规 = 换算系数为 1 的那条;找不到就退回第一条
+  const basic =
+    srcList.find((c) => Number(c?.basicUnitConvertFactor) === 1) ?? srcList[0];
+
+  // update 路径优先复用目标店现有的基础箱规 code,保留其换算关系
+  const targetList = (targetSku?.cartonMeasureConvertFactorList ?? []) as Array<
+    Record<string, unknown>
+  >;
+  const targetBasic =
+    targetList.find((c) => Number(c?.basicUnitConvertFactor) === 1) ?? targetList[0];
+
+  const cartonMeasureCode =
+    direction === 'update' ? targetBasic?.cartonMeasureCode ?? null : null;
+
+  return [
+    {
+      cartonMeasureCode,
+      // 关键:单位名称必须等于 saleUnit
+      cartonMeasureName: saleUnit,
+      basicUnitConvertFactor: 1,
+      basicDistributePrice: basic?.basicDistributePrice ?? null,
+      defaultDistributeUnitFlag: basic?.defaultDistributeUnitFlag ?? 0,
+      areaConfigInfoList: (basic?.areaConfigInfoList as unknown[]) ?? [],
+      boxCodeList: (basic?.boxCodeList as unknown[]) ?? [],
+      weight: basic?.weight ?? null,
+      weightUnit: basic?.weightUnit ?? null,
+      canChangeFactor: basic?.canChangeFactor ?? null,
+    },
+  ];
+}
+
 /** detail.skus[i] → tenantSpu.skus[i](create 与 update 共用,direction 决定附加字段) */
 function buildTenantSkuV2(
   direction: V2Direction,
@@ -1429,7 +1483,7 @@ function buildTenantSkuV2(
     weightUnit: s.weightUnit ?? '',
     expirationForUnit: s.expirationForUnit ?? '',
     expirationUnit: s.expirationUnit ?? '',
-    cartonMeasureConvertFactorList: [] as unknown[],
+    cartonMeasureConvertFactorList: buildCartonMeasureList(direction, s, targetSku, saleUnit),
     skuChannelInfoList,
     erpTenantSkuExtend:
       direction === 'update'
