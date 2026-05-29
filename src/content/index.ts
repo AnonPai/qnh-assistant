@@ -116,6 +116,10 @@ export function startExport(args: {
   limitCount?: number;
   spuNameKeyword?: string;
   spuIdAllowlist?: Array<string | number>;
+  /** SKU id 筛选 */
+  skuIdList?: Array<string | number>;
+  /** SKU 维度的条码(UPC)筛选 */
+  skuUpcList?: string[];
   /** 是否一并下载图片(默认 true) */
   includeImages?: boolean;
   includeVideo?: boolean;
@@ -129,6 +133,8 @@ export function startExport(args: {
     limitCount: args.limitCount,
     spuNameKeyword: args.spuNameKeyword,
     spuIdAllowlist: args.spuIdAllowlist,
+    skuIdList: args.skuIdList,
+    skuUpcList: args.skuUpcList,
     includeImages: args.includeImages,
     includeVideo: args.includeVideo,
     targetDir: args.targetDir,

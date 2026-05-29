@@ -188,31 +188,94 @@ function findAddProductButton(): HTMLElement | null {
 }
 
 /**
- * 从页面筛选区读取「商品名称」输入框的当前值,作为导出表单的预填默认值。
- * 找不到返回空,导出表单可让用户手动填。
+ * 从页面筛选区读取一个筛选输入框的当前值。匹配优先级:
+ *   1) input 的 id 包含给定 idHints 之一(最可靠;牵牛花用 id="spuIdList" 等)
+ *   2) placeholder 包含给定 keywords 之一(antd 常见 "请输入商品名称")
+ *   3) 标签文本紧邻 input(适配 label 在 input 上方/左侧的布局)
+ * 找不到返回空串。
  */
-function readSpuNameFilterFromPage(): string {
-  const inputs = document.querySelectorAll<HTMLInputElement>('input');
-  for (const inp of inputs) {
-    if (inp.offsetParent === null) continue;
-    if ((inp.placeholder || '').includes('商品名称')) {
-      return (inp.value || '').trim();
+function readFilterInputValue(opts: { idHints?: string[]; keywords?: string[] }): string {
+  const idHints = (opts.idHints ?? []).map((s) => s.toLowerCase());
+  const keywords = opts.keywords ?? [];
+  const inputs = Array.from(document.querySelectorAll<HTMLInputElement>('input, textarea'));
+
+  // 1) 按 id 匹配(可见优先,但即使不可见也接受 —— 部分筛选项收在"更多筛选"里)
+  if (idHints.length > 0) {
+    const byId = inputs.find((inp) => {
+      const id = (inp.id || '').toLowerCase();
+      return id && idHints.some((h) => id.includes(h));
+    });
+    if (byId) {
+      const v = (byId.value || '').trim();
+      if (v) return v;
     }
   }
-  const labels = document.querySelectorAll<HTMLElement>('label, div, span');
-  for (const el of labels) {
-    if (el.children.length > 0) continue;
-    const t = (el.textContent || '').trim().replace(/[::]\s*$/, '');
-    if (t !== '商品名称') continue;
-    if (el.offsetParent === null) continue;
-    let cur: HTMLElement | null = el;
-    for (let depth = 0; depth < 4 && cur; depth++) {
-      const inp = cur.parentElement?.querySelector<HTMLInputElement>('input');
-      if (inp && inp.offsetParent !== null) return (inp.value || '').trim();
-      cur = cur.parentElement;
+
+  // 2) 按 placeholder 匹配可见 input
+  if (keywords.length > 0) {
+    for (const inp of inputs) {
+      if (inp.offsetParent === null) continue;
+      const ph = inp.placeholder || '';
+      if (ph && keywords.some((k) => ph.includes(k))) {
+        const v = (inp.value || '').trim();
+        if (v) return v;
+      }
+    }
+    // 3) 兜底:按标签文本找邻近 input
+    const labels = document.querySelectorAll<HTMLElement>('label, div, span');
+    for (const el of labels) {
+      if (el.children.length > 0) continue;
+      const t = (el.textContent || '').trim().replace(/[::]\s*$/, '');
+      if (!t || !keywords.some((k) => t === k)) continue;
+      if (el.offsetParent === null) continue;
+      let cur: HTMLElement | null = el;
+      for (let depth = 0; depth < 4 && cur; depth++) {
+        const inp = cur.parentElement?.querySelector<HTMLInputElement>('input');
+        if (inp && inp.offsetParent !== null) {
+          const v = (inp.value || '').trim();
+          if (v) return v;
+        }
+        cur = cur.parentElement;
+      }
     }
   }
   return '';
+}
+
+/**
+ * 读取门店商品列表页筛选区的当前条件,作为导出表单的预填默认值。
+ * 各字段找不到时返回空串,导出表单可让用户手动填。
+ *
+ * 牵牛花筛选项的真实 input id(抓自页面):
+ *   - SPU ID: id="spuIdList"(placeholder「多码用","隔开,最多500条」)
+ *   - SKU ID: id="skuIdList"(同上 placeholder)
+ *   - 商品条码 / UPC: id 常见含 "upc"
+ *   - 商品名称: id 常见含 "spuName" / "goodsName"
+ */
+function readPageFilters(): {
+  spuNameKeyword: string;
+  spuIds: string;
+  skuIds: string;
+  skuUpcs: string;
+} {
+  return {
+    spuNameKeyword: readFilterInputValue({
+      idHints: ['spuname', 'goodsname'],
+      keywords: ['商品名称', '商品名'],
+    }),
+    spuIds: readFilterInputValue({
+      idHints: ['spuidlist', 'spuid'],
+      keywords: ['SPU ID', 'SPUID', 'SPU编码', 'SPU 编码', '商品ID', '商品 ID'],
+    }),
+    skuIds: readFilterInputValue({
+      idHints: ['skuidlist', 'skuid'],
+      keywords: ['SKU ID', 'SKUID', 'SKU编码', 'SKU 编码'],
+    }),
+    skuUpcs: readFilterInputValue({
+      idHints: ['upclist', 'upc', 'barcode'],
+      keywords: ['商品条码', 'SKU条码', 'SKU 条码', '条码', 'UPC'],
+    }),
+  };
 }
 
 /* ============================================================
@@ -220,10 +283,13 @@ function readSpuNameFilterFromPage(): string {
    ============================================================ */
 
 async function onExportClick() {
-  const initialSpuNameKeyword = readSpuNameFilterFromPage();
+  const pageFilters = readPageFilters();
   const result = await openExportForm({
     callInjected,
-    initialSpuNameKeyword,
+    initialSpuNameKeyword: pageFilters.spuNameKeyword,
+    initialSpuIds: pageFilters.spuIds,
+    initialSkuIds: pageFilters.skuIds,
+    initialSkuUpcs: pageFilters.skuUpcs,
   });
   if (!result) return; // 用户取消
 
@@ -236,7 +302,11 @@ async function onExportClick() {
     title: `导出 ${result.shop.shopName ?? result.shop.shopId} · 准备中`,
     body: `目录:${result.targetDir.name}${result.includeImages ? '' : ' · 不下图片'}${
       result.includeVideo ? ' · 含视频' : ''
-    }${result.spuNameKeyword ? ` · 商品名筛选「${result.spuNameKeyword}」` : ''}`,
+    }${result.spuNameKeyword ? ` · 商品名筛选「${result.spuNameKeyword}」` : ''}${
+      result.spuIdAllowlist ? ` · 指定 SPU ${result.spuIdAllowlist.length} 个` : ''
+    }${result.skuIdList ? ` · SKU ID 筛选 ${result.skuIdList.length} 个` : ''}${
+      result.skuUpcList ? ` · 商品条码筛选 ${result.skuUpcList.length} 个` : ''
+    }`,
     tone: 'info',
   });
   startExport({
@@ -245,6 +315,9 @@ async function onExportClick() {
     includeImages: result.includeImages,
     includeVideo: result.includeVideo,
     spuNameKeyword: result.spuNameKeyword ?? undefined,
+    spuIdAllowlist: result.spuIdAllowlist ?? undefined,
+    skuIdList: result.skuIdList ?? undefined,
+    skuUpcList: result.skuUpcList ?? undefined,
     targetDir: result.targetDir,
   });
 }

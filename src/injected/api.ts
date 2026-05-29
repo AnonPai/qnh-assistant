@@ -251,6 +251,11 @@ export async function fetchProductList(payload: {
    */
   upcList?: string[];
   /**
+   * SKU id 列表过滤,best-effort 透传(同上)。后端如忽略,
+   * 调用方可在拿到结果后按每个 SPU 的 skuIdList 本地精确比对。
+   */
+  skuIdList?: Array<string | number>;
+  /**
    * 拉哪个维度的商品列表:
    *   - 'tenant'(默认):租户主档(整个租户全部商品,几万条)。
    *      import 端做"目标租户是否已存在"查询时用这个。
@@ -259,7 +264,7 @@ export async function fetchProductList(payload: {
    */
   scope?: 'tenant' | 'store';
 }): Promise<{
-  list: Array<{ spuId: string | number; name: string; upcList: string[] }>;
+  list: Array<{ spuId: string | number; name: string; upcList: string[]; skuIdList: string[] }>;
   total: number;
 }> {
   if (payload.scope === 'store') {
@@ -275,8 +280,9 @@ async function fetchProductListTenant(payload: {
   pageSize: number;
   spuName?: string;
   upcList?: string[];
+  skuIdList?: Array<string | number>;
 }): Promise<{
-  list: Array<{ spuId: string | number; name: string; upcList: string[] }>;
+  list: Array<{ spuId: string | number; name: string; upcList: string[]; skuIdList: string[] }>;
   total: number;
 }> {
   void payload.shopId; // 租户端接口不再需要 shopId,通过 cookie 上下文识别租户
@@ -293,6 +299,9 @@ async function fetchProductListTenant(payload: {
   // best-effort 透传过滤参数:仅在调用方传入时附带,避免改变默认请求体形态
   if (payload.spuName) body.spuName = payload.spuName;
   if (payload.upcList && payload.upcList.length > 0) body.upcList = payload.upcList;
+  if (payload.skuIdList && payload.skuIdList.length > 0) {
+    body.skuIdList = payload.skuIdList.map(String);
+  }
 
   const data = await siteFetch<PageQuerySpuResp>(
     '/qnh-gw3/api/product/tenant/page-query?yodaReady=h5&csecplatform=4&csecversion=4.2.0',
@@ -327,8 +336,9 @@ async function fetchProductListStore(payload: {
   pageSize: number;
   spuName?: string;
   upcList?: string[];
+  skuIdList?: Array<string | number>;
 }): Promise<{
-  list: Array<{ spuId: string | number; name: string; upcList: string[] }>;
+  list: Array<{ spuId: string | number; name: string; upcList: string[]; skuIdList: string[] }>;
   total: number;
 }> {
   const body: Record<string, unknown> = {
@@ -343,6 +353,9 @@ async function fetchProductListStore(payload: {
 
   if (payload.spuName) body.spuName = payload.spuName;
   if (payload.upcList && payload.upcList.length > 0) body.upcList = payload.upcList;
+  if (payload.skuIdList && payload.skuIdList.length > 0) {
+    body.skuIdList = payload.skuIdList.map(String);
+  }
 
   const data = await siteFetch<PageQuerySpuResp>(
     '/qnh-gw3/api/product/store/page-query-spu?yodaReady=h5&csecplatform=4&csecversion=4.2.0',
@@ -364,25 +377,35 @@ async function fetchProductListStore(payload: {
   return mapPageQueryResp(data);
 }
 
-/** 把 page-query 响应里的 list 拍平成调用方需要的 { spuId, name, upcList } 形态 */
+/** 把 page-query 响应里的 list 拍平成调用方需要的 { spuId, name, upcList, skuIdList } 形态 */
 function mapPageQueryResp(data: PageQuerySpuResp): {
-  list: Array<{ spuId: string | number; name: string; upcList: string[] }>;
+  list: Array<{ spuId: string | number; name: string; upcList: string[]; skuIdList: string[] }>;
   total: number;
 } {
   const list = (data.data?.list ?? []).map((spu) => {
     const upcList: string[] = [];
-    const seen = new Set<string>();
+    const upcSeen = new Set<string>();
+    const skuIdList: string[] = [];
+    const skuSeen = new Set<string>();
     for (const sku of spu.skus ?? []) {
       for (const upc of sku.upcList ?? []) {
-        if (!upc || seen.has(upc)) continue;
-        seen.add(upc);
+        if (!upc || upcSeen.has(upc)) continue;
+        upcSeen.add(upc);
         upcList.push(upc);
+      }
+      if (sku.skuId != null) {
+        const sid = String(sku.skuId);
+        if (!skuSeen.has(sid)) {
+          skuSeen.add(sid);
+          skuIdList.push(sid);
+        }
       }
     }
     return {
       spuId: spu.spuId,
       name: spu.spuName ?? spu.goodsName ?? String(spu.spuId),
       upcList,
+      skuIdList,
     };
   });
   return {

@@ -181,6 +181,19 @@ function escapeHtml(s: string): string {
   });
 }
 
+/**
+ * 把用户输入的"多 ID 文本"拆成去重后的字符串数组。
+ * 支持逗号(中英文)、空格、换行、顿号、分号作为分隔符。空输入返回 null。
+ */
+function parseIdList(raw: string): string[] | null {
+  const parts = (raw ?? '')
+    .split(/[\s,,、;;]+/)
+    .map((x) => x.trim())
+    .filter(Boolean);
+  if (parts.length === 0) return null;
+  return Array.from(new Set(parts));
+}
+
 function buildShadowHost(html: string): { host: HTMLDivElement; root: ShadowRoot } {
   const host = document.createElement('div');
   host.style.cssText = DIALOG_HOST_STYLE;
@@ -197,6 +210,12 @@ function buildShadowHost(html: string): { host: HTMLDivElement; root: ShadowRoot
 export interface ExportFormResult {
   shop: ShopBrief;
   spuNameKeyword: string | null;
+  /** 精确指定要导出的 SPU id 清单;非空时跳过分页直接按清单导出 */
+  spuIdAllowlist: Array<string | number> | null;
+  /** SKU 维度的条码(UPC)筛选;只导出任一 SKU 命中的商品 */
+  skuUpcList: string[] | null;
+  /** SKU id 筛选;只导出任一 SKU 命中给定 skuId 的商品 */
+  skuIdList: string[] | null;
   /** 是否一并下载图片(默认 true) */
   includeImages: boolean;
   includeVideo: boolean;
@@ -211,6 +230,12 @@ export interface OpenExportFormArgs {
   callInjected: CallInjected;
   /** 表单出现时,如果页面"商品名称"筛选框有值,可由调用方预填 */
   initialSpuNameKeyword?: string;
+  /** 预填 "SPU ID 筛选"(从页面筛选区读到的值) */
+  initialSpuIds?: string;
+  /** 预填 "SKU ID 筛选"(从页面筛选区读到的值) */
+  initialSkuIds?: string;
+  /** 预填 "商品条码筛选"(从页面筛选区读到的值) */
+  initialSkuUpcs?: string;
 }
 
 /**
@@ -240,6 +265,26 @@ export function openExportForm(args: OpenExportFormArgs): Promise<ExportFormResu
               <span class="qnh-fm-section__label">商品名筛选(可选)</span>
               <input class="qnh-fm-input" data-id="spu-name" placeholder="留空则全店导出" />
               <div class="qnh-fm-section__hint">仅导出名称包含此关键字的商品。</div>
+            </div>
+
+            <div class="qnh-fm-section">
+              <span class="qnh-fm-section__label">SPU ID 筛选(可选)</span>
+              <input class="qnh-fm-input" data-id="spu-ids" placeholder="多个用逗号 / 空格 / 换行分隔" />
+              <div class="qnh-fm-section__hint">
+                填了 SPU ID 就只导出这些商品,跳过整店分页(最精确最快)。会忽略其它筛选条件。
+              </div>
+            </div>
+
+            <div class="qnh-fm-section">
+              <span class="qnh-fm-section__label">SKU ID 筛选(可选)</span>
+              <input class="qnh-fm-input" data-id="sku-ids" placeholder="SKU ID,多个用逗号 / 空格 / 换行分隔" />
+              <div class="qnh-fm-section__hint">仅导出"任一 SKU 命中给定 SKU ID"的商品。可与"商品名 / 条码"叠加。</div>
+            </div>
+
+            <div class="qnh-fm-section">
+              <span class="qnh-fm-section__label">商品条码筛选(可选)</span>
+              <input class="qnh-fm-input" data-id="sku-upcs" placeholder="商品条码 / UPC,多个用逗号 / 空格 / 换行分隔" />
+              <div class="qnh-fm-section__hint">仅导出"任一条码命中"的商品(按 SKU 的 UPC 比对)。可与"商品名"叠加。</div>
             </div>
 
             <div class="qnh-fm-section">
@@ -282,6 +327,9 @@ export function openExportForm(args: OpenExportFormArgs): Promise<ExportFormResu
     const shopSelect = $<HTMLSelectElement>('[data-id="shop-select"]')!;
     const shopHint = $('[data-id="shop-hint"]')!;
     const spuName = $<HTMLInputElement>('[data-id="spu-name"]')!;
+    const spuIds = $<HTMLInputElement>('[data-id="spu-ids"]')!;
+    const skuIds = $<HTMLInputElement>('[data-id="sku-ids"]')!;
+    const skuUpcs = $<HTMLInputElement>('[data-id="sku-upcs"]')!;
     const includeImages = $<HTMLInputElement>('[data-id="include-images"]')!;
     const includeVideo = $<HTMLInputElement>('[data-id="include-video"]')!;
     const dirName = $<HTMLInputElement>('[data-id="dir-name"]')!;
@@ -298,6 +346,15 @@ export function openExportForm(args: OpenExportFormArgs): Promise<ExportFormResu
 
     if (args.initialSpuNameKeyword) {
       spuName.value = args.initialSpuNameKeyword;
+    }
+    if (args.initialSpuIds) {
+      spuIds.value = args.initialSpuIds;
+    }
+    if (args.initialSkuIds) {
+      skuIds.value = args.initialSkuIds;
+    }
+    if (args.initialSkuUpcs) {
+      skuUpcs.value = args.initialSkuUpcs;
     }
 
     /* ---- 关闭 ---- */
@@ -503,6 +560,9 @@ export function openExportForm(args: OpenExportFormArgs): Promise<ExportFormResu
       dispose({
         shop: selectedShop,
         spuNameKeyword: spuName.value.trim() || null,
+        spuIdAllowlist: parseIdList(spuIds.value),
+        skuIdList: parseIdList(skuIds.value),
+        skuUpcList: parseIdList(skuUpcs.value),
         includeImages: includeImages.checked,
         includeVideo: includeVideo.checked,
         targetDir: dirHandle,

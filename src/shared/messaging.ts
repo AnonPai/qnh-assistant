@@ -89,7 +89,7 @@ export interface ExportResult {
 export type InjectedCommand =
   | { id: string; type: 'FETCH_SHOP_LIST' }
   | { id: string; type: 'SWITCH_SHOP'; payload: { shopId: string | number } }
-  | { id: string; type: 'FETCH_PRODUCT_LIST'; payload: { shopId: string | number; pageNo: number; pageSize: number; spuName?: string; upcList?: string[]; /** 'tenant' = 租户主档(几万条);'store' = 门店在售(默认导出走这个) */ scope?: 'tenant' | 'store' } }
+  | { id: string; type: 'FETCH_PRODUCT_LIST'; payload: { shopId: string | number; pageNo: number; pageSize: number; spuName?: string; upcList?: string[]; skuIdList?: Array<string | number>; /** 'tenant' = 租户主档(几万条);'store' = 门店在售(默认导出走这个) */ scope?: 'tenant' | 'store' } }
   | { id: string; type: 'FETCH_PRODUCT_DETAIL'; payload: { shopId: string | number; spuId: string | number } }
   | { id: string; type: 'FETCH_CATEGORY_TREE'; payload: { shopId: string | number } }
   | { id: string; type: 'FETCH_FRONT_CATEGORY_TREE'; payload: { shopId: string | number } }

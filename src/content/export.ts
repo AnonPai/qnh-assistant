@@ -48,11 +48,23 @@ interface RunExportArgs {
   /** 商品名关键词模糊匹配 */
   spuNameKeyword?: string;
   /**
-   * 显式指定要导出的 SPU id 列表(冒烟测试 / 灰度);
+   * 显式指定要导出的 SPU id 列表(精确筛选 / 冒烟测试 / 灰度);
    * 设置后会跳过 FETCH_PRODUCT_LIST 分页,直接拿这份清单进队列。
    * 子商品(组合装的 childSkuList)依然会被自动发现并入队。
+   * 优先级高于 spuNameKeyword / skuUpcList —— 一旦给了清单,其它列表筛选条件忽略。
    */
   spuIdAllowlist?: Array<string | number>;
+  /**
+   * 商品条码筛选:UPC / 条码列表。只导出"任一 SKU 命中给定条码"的 SPU。
+   * best-effort 透传给后端的同时,会在拿到门店列表后按 item.upcList 本地兜底过滤
+   * (后端若忽略该参数,本地过滤仍能保证结果正确)。
+   */
+  skuUpcList?: string[];
+  /**
+   * SKU id 筛选:只导出"任一 SKU 命中给定 skuId"的 SPU。
+   * best-effort 透传给后端的同时,会在拿到门店列表后按 item.skuIdList 本地兜底过滤。
+   */
+  skuIdList?: Array<string | number>;
   /** 是否一并导出图片(默认 true);关闭后图片字段保留原始 CDN URL,不会下载到本地 */
   includeImages?: boolean;
   /** 是否一并导出视频(默认 false) */
@@ -65,7 +77,7 @@ interface RunExportArgs {
 }
 
 interface ProductListPage {
-  list: Array<{ spuId: string | number; name: string }>;
+  list: Array<{ spuId: string | number; name: string; upcList?: string[]; skuIdList?: string[] }>;
   total: number;
 }
 
@@ -78,6 +90,8 @@ export async function runExport({
   limitCount,
   spuNameKeyword,
   spuIdAllowlist,
+  skuUpcList,
+  skuIdList,
   includeImages = true,
   includeVideo = false,
   targetDir,
@@ -87,6 +101,12 @@ export async function runExport({
 }: RunExportArgs) {
   const limited = typeof limitCount === 'number' && limitCount > 0;
   const useAllowlist = !!spuIdAllowlist && spuIdAllowlist.length > 0;
+  // 商品条码筛选:规整成去重后的非空集合,供本地兜底过滤
+  const upcFilter = normalizeUpcFilter(skuUpcList);
+  const useUpcFilter = upcFilter.size > 0;
+  // SKU id 筛选:同样规整成去重后的非空集合
+  const skuIdFilter = normalizeUpcFilter(skuIdList?.map(String));
+  const useSkuIdFilter = skuIdFilter.size > 0;
 
   // ---- 0) 准备目录与续传状态 ----
   const productsDir = await getOrCreateDir(targetDir, 'products');
@@ -158,7 +178,7 @@ export async function runExport({
       onProgress({ kind: 'export', phase: 'list', current: 0, total: 0, message: '加载商品列表' });
       let pageNo = 1;
       const pageSize = limited ? 10 : 50;
-      const allList: Array<{ spuId: string | number; name: string }> = [];
+      const allList: Array<{ spuId: string | number; name: string; upcList?: string[]; skuIdList?: string[] }> = [];
       while (!cancelFlag.cancelled) {
         const page = await callInjected<ProductListPage>({
           type: 'FETCH_PRODUCT_LIST',
@@ -167,6 +187,8 @@ export async function runExport({
             pageNo,
             pageSize,
             spuName: spuNameKeyword,
+            upcList: useUpcFilter ? [...upcFilter] : undefined,
+            skuIdList: useSkuIdFilter ? [...skuIdFilter] : undefined,
             scope: 'store',
           },
         });
@@ -192,8 +214,23 @@ export async function runExport({
         });
         throw new Error('已取消');
       }
-      const targetList = limited ? allList.slice(0, limitCount!) : allList;
-      log.info(`商品总数: ${allList.length}${limited ? `,本次仅导出前 ${targetList.length} 个` : ''}`);
+      const limitedList = limited ? allList.slice(0, limitCount!) : allList;
+      // 本地兜底过滤:后端如果忽略了 upcList / skuIdList 透传,这里按门店列表里
+      // 每个 SPU 的 upcList / skuIdList 精确比对。两个筛选都给时取交集(都要命中)。
+      const targetList = limitedList.filter((it) => {
+        if (useUpcFilter && !(it.upcList ?? []).some((u) => upcFilter.has(normalizeUpc(u)))) {
+          return false;
+        }
+        if (useSkuIdFilter && !(it.skuIdList ?? []).some((s) => skuIdFilter.has(normalizeUpc(s)))) {
+          return false;
+        }
+        return true;
+      });
+      log.info(
+        `商品总数: ${allList.length}` +
+          (limited ? `,本次仅导出前 ${limitedList.length} 个` : '') +
+          (useUpcFilter || useSkuIdFilter ? `,按 SKU/条码筛选后 ${targetList.length} 个` : ''),
+      );
       queue.push(
         ...targetList.map((it) => ({ spuId: it.spuId, name: it.name, reason: 'list' as const })),
       );
@@ -515,9 +552,24 @@ function replaceUrlsInSpu(spu: ProductSpu, urlToHash: Map<string, string>): Prod
   return visit(spu) as ProductSpu;
 }
 
+/** SKU 条码筛选:把 UPC 列表去重、去空、规整 */
+function normalizeUpcFilter(list?: string[]): Set<string> {
+  const out = new Set<string>();
+  for (const raw of list ?? []) {
+    const u = normalizeUpc(raw);
+    if (u) out.add(u);
+  }
+  return out;
+}
+
+/** 单个 UPC 规整:trim,去掉内部空白(条码里偶尔粘了空格) */
+function normalizeUpc(u: string | number | null | undefined): string {
+  if (u == null) return '';
+  return String(u).trim().replace(/\s+/g, '');
+}
+
 /** 收集组合装的子 SPU id */
-function collectChildSpuIds(spu: ProductSpu): Array<string | number> {
-  const detail = spu.raw?.detail as
+function collectChildSpuIds(spu: ProductSpu): Array<string | number> {  const detail = spu.raw?.detail as
     | { skus?: Array<{ childSkuList?: Array<{ spuId?: string | number }> | null }> }
     | undefined;
   if (!detail?.skus) return [];
