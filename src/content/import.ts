@@ -204,15 +204,17 @@ export async function runImport({
   if (userOverrides.size > 0) {
     log.info(`已加载用户分类映射:${userOverrides.size} 条`);
   }
-  const frontCategoryIdRemap = await validateFrontCategories(
-    callInjected,
-    products,
-    probeShopId,
-    userOverrides,
-    sourceDir,
-  );
+  const { idRemap: frontCategoryIdRemap, pathRemap: frontCategoryPathRemap } =
+    await validateFrontCategories(
+      callInjected,
+      products,
+      probeShopId,
+      userOverrides,
+      sourceDir,
+    );
   log.info(
-    `店内分类映射就绪:${Object.keys(frontCategoryIdRemap).length} 条`,
+    `店内分类映射就绪:ID ${Object.keys(frontCategoryIdRemap).length} 条,` +
+      `路径改写 ${frontCategoryPathRemap.size} 条`,
     frontCategoryIdRemap,
   );
 
@@ -352,6 +354,7 @@ export async function runImport({
               urlHashCache,
               sourceMediaDir: mediaDir,
               compareImages: syncImages,
+              frontCategoryPathRemap,
             },
           )
         ) {
@@ -399,6 +402,7 @@ export async function runImport({
           targetShopId: probeShopId,
           mediaIdMap,
           skippedVideoHashes,
+          urlHashCache,
           onProgress,
           cancelFlag,
           callInjected,
@@ -677,6 +681,18 @@ async function buildSkuMapping(
 }
 
 /**
+ * 店内分类校验产物:
+ *   - idRemap:源「店内分类」ID → 目标租户「店内分类」ID,createProduct/updateProduct 用它改写
+ *   - pathRemap:源「店内分类」namePath → 目标「店内分类」namePath。
+ *     仅当映射到"不同名"的目标分类时才有意义;`isProductSame` 用它把源快照的
+ *     店内分类翻译成目标侧的预期值,避免"映射后每次都误判为已修改"。
+ */
+interface FrontCategoryResolveResult {
+  idRemap: Record<string, string>;
+  pathRemap: Map<string, string>;
+}
+
+/**
  * 跨租户导入前的"店内分类"校验:
  *   - 收集导出包里所有商品引用到的店内分类(name path + 源 ID)
  *   - 拉一次目标租户的店内分类树
@@ -684,7 +700,7 @@ async function buildSkuMapping(
  *   - 仍找不到的,看用户提供的映射文件里有没有"源 path → 目标 path"的覆盖
  *   - 任何一个最终找不到 → 把"已自动匹配 + 缺失"的清单写到源目录,
  *     抛错让用户编辑后下次重传(不上传任何图,流程在这里就终止)
- *   - 全部命中 → 返回"源 ID → 目标 ID"的映射表,createProduct 时用它改写
+ *   - 全部命中 → 返回"源 ID → 目标 ID" + "源 path → 目标 path"两张映射表
  *
  * 这样可以避免"开始上传媒体之后才发现分类不存在"的尴尬。
  */
@@ -694,7 +710,7 @@ async function validateFrontCategories(
   targetShopId: string | number,
   userOverrides: Map<string, string>,
   sourceDir: FileSystemDirectoryHandle,
-): Promise<Record<string, string>> {
+): Promise<FrontCategoryResolveResult> {
   // 1) 收集源端用到的店内分类 (name path → 源 ID 集合)
   type SourceRef = { sourceId: string; namePath: string[] };
   const refs: SourceRef[] = [];
@@ -720,7 +736,7 @@ async function validateFrontCategories(
       }
     }
   }
-  if (refs.length === 0) return {};
+  if (refs.length === 0) return { idRemap: {}, pathRemap: new Map() };
 
   // 2) 拉目标店内分类树
   let tree: FrontCategoryNode[];
@@ -772,14 +788,19 @@ async function validateFrontCategories(
 
   // 5) 按解析结果分桶
   const remap: Record<string, string> = {};
+  // 源 namePath → 目标 namePath,仅在"映射到不同名分类"时记录;
+  // 同名自动匹配(auto)源/目标一致,无需记入(记了也不影响,只是冗余)。
+  const pathRemap = new Map<string, string>();
   const autoMatched: string[] = [];
   const userMapped: Array<{ source: string; target: string }> = [];
   const missing: string[] = []; // 用户没填或填错的源 path
   const mappedMissing: Array<{ source: string; mappedTo: string }> = []; // 用户填了但目标店不存在
   for (const [key, res] of resolved) {
     if (res.status === 'auto') autoMatched.push(key);
-    else if (res.status === 'mapped') userMapped.push({ source: key, target: res.targetPath });
-    else if (res.status === 'mapped-missing') mappedMissing.push({ source: key, mappedTo: res.mappedTo });
+    else if (res.status === 'mapped') {
+      userMapped.push({ source: key, target: res.targetPath });
+      if (res.targetPath !== key) pathRemap.set(key, res.targetPath);
+    } else if (res.status === 'mapped-missing') mappedMissing.push({ source: key, mappedTo: res.mappedTo });
     else missing.push(key);
   }
 
@@ -795,7 +816,7 @@ async function validateFrontCategories(
     log.info(
       `店内分类校验通过:${refs.length} 处引用 → 自动匹配 ${autoMatched.length},用户映射 ${userMapped.length}`,
     );
-    return remap;
+    return { idRemap: remap, pathRemap };
   }
 
   // 6) 还有缺失 → 写一份完整模板回源目录,抛错指导用户修复
@@ -923,6 +944,11 @@ async function uploadMediaForProduct(args: {
   targetShopId: string | number;
   mediaIdMap: Record<string, UploadedMedia>;
   skippedVideoHashes: Set<string>;
+  /**
+   * 可选:URL→hash 缓存。上传成功后顺手把"源图 hash ≡ 目标店重编码后 hash"登记进去,
+   * 让后续(及下次)的"修改前对比"不再因美团服务端重编码而永远误判"已修改"。
+   */
+  urlHashCache?: UrlHashCache;
   onProgress: (e: ProgressEvent) => void;
   cancelFlag: { cancelled: boolean };
   callInjected: CallInjected;
@@ -935,6 +961,7 @@ async function uploadMediaForProduct(args: {
     targetShopId,
     mediaIdMap,
     skippedVideoHashes,
+    urlHashCache,
     onProgress,
     cancelFlag,
     callInjected,
@@ -1006,6 +1033,23 @@ async function uploadMediaForProduct(args: {
       payload: { shopId: targetShopId, kind, mime, bytesBase64: bytesToBase64(buf) },
     });
     mediaIdMap[hash] = uploaded;
+
+    // 登记"源图 hash ≡ 目标店重编码后 hash"等价关系:
+    // 美团对上传图做服务端重编码,目标 URL 下载回来的字节 hash 跟源文件必然不同,
+    // 不记下来的话,"修改前对比"里这张图永远对不上 → 每次都误判"已修改"。
+    // 下载目标 URL 的开销复用 urlHashCache(对比阶段本来也要下),命中即免重下。
+    if (urlHashCache && uploaded.fileUrl) {
+      try {
+        const targetHash = await urlHashCache.getOrCompute(
+          uploaded.fileUrl,
+          fetchUrlAsArrayBuffer,
+        );
+        urlHashCache.recordUploadEquiv(hash, targetHash);
+      } catch (e) {
+        // 算目标 hash 失败不致命:大不了这张图这次仍走 update,下次再补
+        log.warn(`登记上传等价失败(忽略): ${hash} → ${uploaded.fileUrl}`, e);
+      }
+    }
     // 单张图上传之间留 ~0.5s,降低连发被风控的概率
     await jitter(...THROTTLE.IMPORT_MEDIA_UPLOAD);
   }
@@ -1330,21 +1374,47 @@ async function isProductSame(
     sourceMediaDir: FileSystemDirectoryHandle | null;
     /** false 时跳过图片字段比对,只比非图字段(配合 syncImages = false 使用) */
     compareImages?: boolean;
+    /**
+     * 源「店内分类」namePath → 目标「店内分类」namePath。
+     * 跨租户导入时,源端分类常被映射到目标店里"不同名"的分类;
+     * 比对前先把源快照里的店内分类翻译成目标侧预期值,避免"映射后每次都误判为已修改"。
+     */
+    frontCategoryPathRemap?: Map<string, string>;
   },
 ): Promise<boolean> {
   if (!src || !tgt) return false;
   try {
-    // 非图片字段:直接做规范化结构对比
-    const a = canonicalizeNonMediaForCompare(src);
-    const b = canonicalizeNonMediaForCompare(tgt);
-    if (JSON.stringify(a) !== JSON.stringify(b)) return false;
+    // 非图片字段:直接做规范化结构对比。
+    // 源侧应用店内分类 path 改写(把源 namePath 翻译成目标侧预期值),目标侧不改写。
+    const a = canonicalizeNonMediaForCompare(src, ctx.frontCategoryPathRemap) as Record<
+      string,
+      unknown
+    >;
+    const b = canonicalizeNonMediaForCompare(tgt) as Record<string, unknown>;
+    if (JSON.stringify(a) !== JSON.stringify(b)) {
+      // 逐字段定位首个差异,打到日志,方便排查"明明没改却走 update"的情况
+      for (const key of Object.keys(a)) {
+        const av = JSON.stringify(a[key]);
+        const bv = JSON.stringify(b[key]);
+        if (av !== bv) {
+          log.info(
+            `[对比差异] 字段「${key}」不一致 → 走 update\n  源端: ${truncateForLog(av)}\n  目标: ${truncateForLog(bv)}`,
+          );
+          break;
+        }
+      }
+      return false;
+    }
 
     if (ctx.compareImages === false) return true;
 
-    // 图片字段:把 URL/占位符 都解成 sha256,再按位比较
+    // 图片字段:把 URL/占位符 都解成 sha256,再按"内容等价"比较。
+    // "等价"= 字面相等 或 命中上传重编码等价表(源图上传到目标店被美团重编码,
+    // 字节 hash 必然变,但等价表记录了这层对应关系)。
     const resolveSrc = (url: string) => resolveImageHash(url, ctx, 'source');
     const resolveTgt = (url: string) => resolveImageHash(url, ctx, 'target');
-    return await compareMediaFields(src, tgt, resolveSrc, resolveTgt);
+    const eq = (x: string, y: string) => ctx.urlHashCache.hashesEquivalent(x, y);
+    return await compareMediaFields(src, tgt, resolveSrc, resolveTgt, eq);
   } catch (e) {
     log.warn('参数比对失败,保守起见走 update 路径', e);
     return false;
@@ -1397,29 +1467,63 @@ async function compareMediaFields(
   tgt: Record<string, unknown>,
   resolveSrc: (url: string) => Promise<string>,
   resolveTgt: (url: string) => Promise<string>,
+  /** 内容 hash 等价判定:字面相等 或 命中上传重编码等价表 */
+  eq: (a: string, b: string) => boolean,
 ): Promise<boolean> {
   const get = <T>(o: Record<string, unknown>, k: string): T | undefined => o[k] as T | undefined;
 
-  // 主图 / 图文详情:按位比
-  const eqList = async (a: string[], b: string[]) => {
-    if (a.length !== b.length) return false;
+  // 写入端(buildTenantSpuV2)对 picUrlList / picContentList 会做 uniqueStrings(...).filter(Boolean),
+  // 即"去重 + 去空"后才落库。比对必须用同一套归一,否则源端若有重复/空串(常见于历史导出包),
+  // 会跟目标店实际落库的去重结果对不上,导致"明明没改却每次都 update"。
+  const dedupNonEmpty = (arr: string[]): string[] => {
+    const seen = new Set<string>();
+    const out: string[] = [];
+    for (const s of arr) {
+      if (typeof s !== 'string' || !s) continue;
+      if (seen.has(s)) continue;
+      seen.add(s);
+      out.push(s);
+    }
+    return out;
+  };
+
+  // 主图 / 图文详情:按位比。不一致时把 长度 / 解析出的 hash 打到日志,方便定位。
+  const eqList = async (label: string, a: string[], b: string[]) => {
+    if (a.length !== b.length) {
+      log.info(
+        `[对比差异] 图片字段「${label}」数量不一致 → 走 update(源 ${a.length} 张 / 目标 ${b.length} 张)\n  源端: ${truncateForLog(JSON.stringify(a))}\n  目标: ${truncateForLog(JSON.stringify(b))}`,
+      );
+      return false;
+    }
     const ah = await Promise.all(a.map(resolveSrc));
     const bh = await Promise.all(b.map(resolveTgt));
     for (let i = 0; i < ah.length; i++) {
-      if (ah[i] !== bh[i] || !ah[i]) return false; // 任一为空 hash 视为不同(避免误判)
+      if (!ah[i] || !eq(ah[i], bh[i])) {
+        log.info(
+          `[对比差异] 图片字段「${label}」第 ${i + 1} 张内容不一致 → 走 update\n` +
+            `  源端 url: ${a[i]}  hash: ${ah[i] || '(空)'}\n` +
+            `  目标 url: ${b[i]}  hash: ${bh[i] || '(空)'}`,
+        );
+        return false; // 任一为空 hash 视为不同(避免误判)
+      }
     }
     return true;
   };
 
   if (
-    !(await eqList(get<string[]>(src, 'picUrlList') ?? [], get<string[]>(tgt, 'picUrlList') ?? []))
+    !(await eqList(
+      'picUrlList',
+      dedupNonEmpty(get<string[]>(src, 'picUrlList') ?? []),
+      dedupNonEmpty(get<string[]>(tgt, 'picUrlList') ?? []),
+    ))
   ) {
     return false;
   }
   if (
     !(await eqList(
-      get<string[]>(src, 'picContentList') ?? [],
-      get<string[]>(tgt, 'picContentList') ?? [],
+      'picContentList',
+      dedupNonEmpty(get<string[]>(src, 'picContentList') ?? []),
+      dedupNonEmpty(get<string[]>(tgt, 'picContentList') ?? []),
     ))
   ) {
     return false;
@@ -1428,30 +1532,44 @@ async function compareMediaFields(
   // 视频:videoInfo.videoUrl(单个),空对空也算相等
   const srcVideo = get<{ videoUrl?: string }>(src, 'videoInfo')?.videoUrl ?? '';
   const tgtVideo = get<{ videoUrl?: string }>(tgt, 'videoInfo')?.videoUrl ?? '';
-  if (!!srcVideo !== !!tgtVideo) return false;
+  if (!!srcVideo !== !!tgtVideo) {
+    log.info(
+      `[对比差异] 视频有无不一致 → 走 update(源 ${srcVideo ? '有' : '无'} / 目标 ${tgtVideo ? '有' : '无'})`,
+    );
+    return false;
+  }
   if (srcVideo && tgtVideo) {
     const sh = await resolveSrc(srcVideo);
     const th = await resolveTgt(tgtVideo);
-    if (sh !== th || !sh) return false;
+    if (!sh || !eq(sh, th)) {
+      log.info(
+        `[对比差异] 视频内容不一致 → 走 update\n  源端 hash: ${sh || '(空)'}\n  目标 hash: ${th || '(空)'}`,
+      );
+      return false;
+    }
   }
 
   // 渠道特殊图:按 pictureType 分桶,桶内按位比
   if (
     !(await eqSpecialPictures(
+      'mtSpecialPictureList',
       get<Array<Record<string, unknown>>>(src, 'mtSpecialPictureList'),
       get<Array<Record<string, unknown>>>(tgt, 'mtSpecialPictureList'),
       resolveSrc,
       resolveTgt,
+      eq,
     ))
   ) {
     return false;
   }
   if (
     !(await eqSpecialPictures(
+      'elmSpecialPictureList',
       get<Array<Record<string, unknown>>>(src, 'elmSpecialPictureList'),
       get<Array<Record<string, unknown>>>(tgt, 'elmSpecialPictureList'),
       resolveSrc,
       resolveTgt,
+      eq,
     ))
   ) {
     return false;
@@ -1462,10 +1580,12 @@ async function compareMediaFields(
 
 /** 渠道特殊图按 pictureType 分桶后,逐桶按位比对(走 hash 路径) */
 async function eqSpecialPictures(
+  label: string,
   src: Array<Record<string, unknown>> | undefined,
   tgt: Array<Record<string, unknown>> | undefined,
   resolveSrc: (url: string) => Promise<string>,
   resolveTgt: (url: string) => Promise<string>,
+  eq: (a: string, b: string) => boolean,
 ): Promise<boolean> {
   const norm = (list: Array<Record<string, unknown>> | undefined) => {
     const groups: Array<{ pictureType: number; urls: string[] }> = [];
@@ -1479,14 +1599,36 @@ async function eqSpecialPictures(
   };
   const a = norm(src);
   const b = norm(tgt);
-  if (a.length !== b.length) return false;
+  if (a.length !== b.length) {
+    log.info(
+      `[对比差异] 特殊图「${label}」分桶数量不一致 → 走 update(源 ${a.length} 桶 / 目标 ${b.length} 桶)`,
+    );
+    return false;
+  }
   for (let i = 0; i < a.length; i++) {
-    if (a[i].pictureType !== b[i].pictureType) return false;
-    if (a[i].urls.length !== b[i].urls.length) return false;
+    if (a[i].pictureType !== b[i].pictureType) {
+      log.info(
+        `[对比差异] 特殊图「${label}」pictureType 不一致 → 走 update(源 ${a[i].pictureType} / 目标 ${b[i].pictureType})`,
+      );
+      return false;
+    }
+    if (a[i].urls.length !== b[i].urls.length) {
+      log.info(
+        `[对比差异] 特殊图「${label}」pictureType=${a[i].pictureType} 图片数量不一致 → 走 update(源 ${a[i].urls.length} 张 / 目标 ${b[i].urls.length} 张)`,
+      );
+      return false;
+    }
     const ah = await Promise.all(a[i].urls.map(resolveSrc));
     const bh = await Promise.all(b[i].urls.map(resolveTgt));
     for (let j = 0; j < ah.length; j++) {
-      if (ah[j] !== bh[j] || !ah[j]) return false;
+      if (!ah[j] || !eq(ah[j], bh[j])) {
+        log.info(
+          `[对比差异] 特殊图「${label}」pictureType=${a[i].pictureType} 第 ${j + 1} 张内容不一致 → 走 update\n` +
+            `  源端 url: ${a[i].urls[j]}  hash: ${ah[j] || '(空)'}\n` +
+            `  目标 url: ${b[i].urls[j]}  hash: ${bh[j] || '(空)'}`,
+        );
+        return false;
+      }
     }
   }
   return true;
@@ -1500,7 +1642,10 @@ async function eqSpecialPictures(
  *   - SKU 的 onlineChannels / onlineStatus 是店内属性,同上
  *   - storeFrontCategoryList 跨租户 ID 不一样,只比 namePath
  */
-function canonicalizeNonMediaForCompare(d: Record<string, unknown>): unknown {
+function canonicalizeNonMediaForCompare(
+  d: Record<string, unknown>,
+  frontCategoryPathRemap?: Map<string, string>,
+): unknown {
   const get = <T>(o: Record<string, unknown>, k: string): T | undefined =>
     o[k] as T | undefined;
 
@@ -1523,13 +1668,20 @@ function canonicalizeNonMediaForCompare(d: Record<string, unknown>): unknown {
     .sort((a, b) => Number(a.channelId ?? 0) - Number(b.channelId ?? 0));
 
   // --- 店内分类(只比 namePath,跨租户 categoryCode 必然不同) ---
+  // namePath 在 tenant/detail 里以 ">" 分隔(如 "膨化食品>乐事薯片"),
+  // 这里统一归一成 "/" 分隔,跟 validateFrontCategories 的 path key 对齐。
+  // 源侧:若该分类被映射到目标店里"不同名"的分类,先翻译成目标 namePath,
+  //       这样跟目标店实际落库的 namePath 对得上,不会每次都误判为已修改。
+  // 目标侧:不传 remap,原样归一即可。
   const frontCats: string[] = [];
   for (const group of get<Array<{ storeCategoryList?: Array<{ namePath?: string }> }>>(
     d,
     'storeFrontCategoryList',
   ) ?? []) {
     for (const c of group.storeCategoryList ?? []) {
-      if (c.namePath) frontCats.push(c.namePath);
+      if (!c.namePath) continue;
+      const canonical = c.namePath.split('>').filter(Boolean).join('/');
+      frontCats.push(frontCategoryPathRemap?.get(canonical) ?? canonical);
     }
   }
   frontCats.sort();
@@ -1610,4 +1762,10 @@ function trimZero(s: string): string {
   if (!s) return '';
   if (!s.includes('.')) return s;
   return s.replace(/\.?0+$/, '');
+}
+
+/** 把可能很长的 JSON 字符串截断,避免比对差异日志刷屏 */
+function truncateForLog(s: string | undefined, max = 600): string {
+  if (s == null) return '(undefined)';
+  return s.length > max ? `${s.slice(0, max)}…(${s.length} chars)` : s;
 }

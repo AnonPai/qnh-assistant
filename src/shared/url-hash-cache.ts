@@ -18,6 +18,12 @@ interface CacheFile {
   schemaVersion: 1;
   /** url(已 normalize:scheme 升 https,去掉 query/hash)→ sha256 hex */
   entries: Record<string, string>;
+  /**
+   * 「源图内容 hash」→「上传到目标店后、美团重新编码存储的内容 hash」等价表。
+   * 美团对上传图会做服务端重编码,源文件 sha256 与目标存储 sha256 必然不同,
+   * 但对同一张源图是确定性的。记下这条等价关系,重复导入时比对才不会永远误判"已修改"。
+   */
+  uploadEquiv?: Record<string, string>;
 }
 
 const CACHE_FILE = '.qnh-target-image-hashes.json';
@@ -39,19 +45,47 @@ function canonicalizeUrl(url: string): string {
 export class UrlHashCache {
   /** url(canonical)→ hash 的纯内存视图 */
   private readonly map: Map<string, string>;
+  /** 源图内容 hash → 目标店重编码后存储的内容 hash(双向都登记,查的时候两边都认) */
+  private readonly uploadEquiv: Map<string, string>;
   /** 哪些 key 在内存改过,持久化时只写这部分(其实整体落盘也行,文件不大) */
   private dirty = false;
   /** 同一 url 并发计算时复用同一 Promise,避免重复下载 */
   private readonly inflight = new Map<string, Promise<string>>();
 
-  private constructor(initial: Record<string, string>) {
+  private constructor(initial: Record<string, string>, uploadEquiv?: Record<string, string>) {
     this.map = new Map(Object.entries(initial));
+    this.uploadEquiv = new Map(Object.entries(uploadEquiv ?? {}));
   }
 
   static async load(dir: FileSystemDirectoryHandle | null | undefined): Promise<UrlHashCache> {
     if (!dir) return new UrlHashCache({});
     const data = await tryReadCache(dir);
-    return new UrlHashCache(data?.entries ?? {});
+    return new UrlHashCache(data?.entries ?? {}, data?.uploadEquiv);
+  }
+
+  /**
+   * 登记一条"源图 hash ≡ 目标店重编码后 hash"的等价关系。
+   * 在图片上传成功、且我们随后下载目标 URL 算出其存储 hash 时调用。
+   */
+  recordUploadEquiv(sourceHash: string, targetHash: string): void {
+    if (!sourceHash || !targetHash || sourceHash === targetHash) return;
+    const s = sourceHash.toLowerCase();
+    const t = targetHash.toLowerCase();
+    if (this.uploadEquiv.get(s) === t) return; // 已记过,免脏写
+    this.uploadEquiv.set(s, t);
+    this.dirty = true;
+  }
+
+  /**
+   * 判断两个内容 hash 是否"等价":字面相等,或被上传重编码等价表关联。
+   * 源图与目标存储图字节不同但语义同一时(走过上传路径),据此判等。
+   */
+  hashesEquivalent(a: string, b: string): boolean {
+    if (!a || !b) return false;
+    const x = a.toLowerCase();
+    const y = b.toLowerCase();
+    if (x === y) return true;
+    return this.uploadEquiv.get(x) === y || this.uploadEquiv.get(y) === x;
   }
 
   /**
@@ -93,6 +127,7 @@ export class UrlHashCache {
     const out: CacheFile = {
       schemaVersion: 1,
       entries: Object.fromEntries(this.map),
+      uploadEquiv: Object.fromEntries(this.uploadEquiv),
     };
     try {
       await writeCache(dir, out);
