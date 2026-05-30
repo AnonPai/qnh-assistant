@@ -21,6 +21,7 @@ import {
 } from '@shared/messaging';
 import { runExport } from './export';
 import { runImport } from './import';
+import { runSync } from './sync';
 import { mountInPageUI, openInPageEntry } from './inpage-ui';
 
 const log = createLogger('content');
@@ -159,6 +160,8 @@ export function startImport(args: {
   confirmMode?: import('@shared/messaging').ImportConfirmMode;
   /** 是否同步图片(默认 true);false 时跳过上传与图片比对 */
   syncImages?: boolean;
+  /** 名称一致但 UPC 不一致时是否走修改(默认 false) */
+  updateOnNameMatch?: boolean;
   /** 可选:用户人工维护的「店内分类映射」文件 */
   frontCategoryMappingFile?: File | null;
   /** 手动模式必填:UI 层弹确认框,返回用户决定 */
@@ -171,6 +174,7 @@ export function startImport(args: {
     mode: args.mode ?? 'full',
     confirmMode: args.confirmMode ?? 'auto',
     syncImages: args.syncImages ?? true,
+    updateOnNameMatch: args.updateOnNameMatch ?? false,
     frontCategoryMappingFile: args.frontCategoryMappingFile,
     requestConfirm: args.requestConfirm,
     cancelFlag,
@@ -178,6 +182,31 @@ export function startImport(args: {
     callInjected,
   }).catch((e) => {
     log.error('import error', e);
+    reportProgress({ kind: 'error', message: String(e?.message ?? e) });
+  });
+}
+
+export function startSync(args: {
+  /** 目标门店 */
+  shopId: string | number;
+  shopName?: string;
+  syncStock: boolean;
+  syncPrice: boolean;
+  /** 数据源目录(导出产物) */
+  sourceDir: FileSystemDirectoryHandle;
+}) {
+  cancelFlag = { cancelled: false };
+  runSync({
+    shopId: args.shopId,
+    shopName: args.shopName,
+    syncStock: args.syncStock,
+    syncPrice: args.syncPrice,
+    sourceDir: args.sourceDir,
+    cancelFlag,
+    onProgress: reportProgress,
+    callInjected,
+  }).catch((e) => {
+    log.error('sync error', e);
     reportProgress({ kind: 'error', message: String(e?.message ?? e) });
   });
 }

@@ -1223,10 +1223,18 @@ function buildTenantSpuV2(
 
   // 渠道列表(create / update 形态差异较大)
   // 多规格(specType=2)需要把 SKU 上的销售属性聚合到渠道级 saleAttrList,否则
-  // 京东(ch300)/饿了么(ch200)创建时会报"多规格销售属性必填" —— 源 detail 里
-  // 这两个渠道的 saleAttrValueList 经常是空的,只有 ch100 是满的,
-  // 但每个 SKU 的 skuChannelInfoList[].saleAttrValueList 都给齐了 attrId/attrName/attrValue。
-  const channelSaleAttrAgg = buildChannelSaleAttrAgg(detail);
+  // 京东(ch300)/饿了么(ch200)会报"多规格销售属性必填" —— detail 里这两个渠道的
+  // 渠道级 saleAttrValueList 经常是空的,只有 ch100 是满的,但每个 SKU 的
+  // skuChannelInfoList[].saleAttrValueList 都给齐了 attrId/attrName/attrValue。
+  //
+  // 关键:销售属性聚合的数据源按方向区分。
+  //   - create:用源端 detail(新建商品,值来自源)。
+  //   - update:用**目标商品 detail**。销售属性一旦推送到渠道(京东/饿了么)就不可变更,
+  //     若透传源端的值,只要和目标店现有值不一致就会被判"变更已推送渠道的销售属性值"而拒绝;
+  //     但给空数组又会触发"多规格销售属性必填"。两难之下,唯一两全的做法是回传
+  //     目标商品自身现有的销售属性 —— 它本就是已推送的值,既满足"必填",又不构成"变更"。
+  const saleAttrSourceDetail = direction === 'update' && targetDetail ? targetDetail : detail;
+  const channelSaleAttrAgg = buildChannelSaleAttrAgg(saleAttrSourceDetail);
   const spuChannelInfoList = channelList.map((c) => {
     const target = (targetDetail?.spuChannelInfoList ?? []).find(
       (x) => x.channelId === c.channelId,
@@ -1445,9 +1453,15 @@ function buildTenantSkuV2(
   const onlineStatus = s.onlineStatus ?? 1;
   const saleUnit = s.saleUnit && s.saleUnit.trim() ? s.saleUnit : '';
 
-  // 渠道侧的售卖属性需要透传(否则多规格商品在京东/饿了么会报"销售属性必填")
-  // 元素只保留接口需要的字段:channelId / saleAttrValueList(attrId 必须是 number)
-  const skuChannelInfoList = (s.skuChannelInfoList ?? [])
+  // 渠道侧的售卖属性:
+  //   - create:透传源端 SKU 的 saleAttrValueList(否则多规格商品在京东/饿了么会报"销售属性必填")。
+  //   - update:**透传目标 SKU 现有的 saleAttrValueList**,不能用源端的值。
+  //     销售属性推送渠道后不可变更:给空会报"多规格销售属性必填",给源端值(若与目标店不一致)
+  //     会报"已经推送渠道的情况下,京东销售属性值不允许变更"。回传目标 SKU 自身的现有值,
+  //     既满足必填、又不构成变更(本 SKU 的 skuId 也取自同一个 targetSku,二者天然对齐)。
+  // 元素只保留接口需要的字段:channelId / saleAttrValueList(attrId 必须是 number)。
+  const saleAttrSourceSku = direction === 'update' ? targetSku : s;
+  const skuChannelInfoList = (saleAttrSourceSku?.skuChannelInfoList ?? [])
     .filter((ch) => ch && ch.channelId != null)
     .map((ch) => {
       const attrs = (ch.saleAttrValueList ?? [])
@@ -1548,9 +1562,18 @@ function buildSpuChannelInfoV2(
 
   const cAny = c as Record<string, unknown>;
 
-  // saleAttrList:用源端定义当骨架,把每个 attr 的 saleAttrValueList 补齐
-  // (源 detail 里 ch200/ch300 经常给空数组,此时用 SKU 反聚合的值兜底)
-  const sourceSaleAttrs = (c.saleAttrList ?? []) as Array<Record<string, unknown>>;
+  // saleAttrList:用渠道定义当骨架,把每个 attr 的 saleAttrValueList 补齐
+  //   - create:骨架 + 值都来自源端 detail(源 detail 里 ch200/ch300 经常给空数组,
+  //     此时用 SKU 反聚合的值兜底),否则京东/饿了么创建时报"多规格销售属性必填"。
+  //   - update:骨架优先用**目标渠道**的 saleAttrList(attrId/attrName 与目标店一致),
+  //     值用 aggregatedSaleAttrs 兜底 —— 上层在 update 方向已把聚合数据源切换成目标商品 detail,
+  //     因此补进去的是目标店现有销售属性,既满足"必填"又不构成"变更"
+  //     (避免"已推送渠道销售属性不允许变更")。
+  const sourceSaleAttrs = (
+    (direction === 'update' && target?.saleAttrList && target.saleAttrList.length > 0
+      ? target.saleAttrList
+      : c.saleAttrList) ?? []
+  ) as Array<Record<string, unknown>>;
   const saleAttrList = mergeSaleAttrList(sourceSaleAttrs, aggregatedSaleAttrs);
 
   const out: Record<string, unknown> = {
@@ -1893,4 +1916,225 @@ function pickChannelField<T>(
   if (t && t[key] != null) return t[key] as T;
   if (s && s[key] != null) return s[key] as T;
   return undefined;
+}
+
+// ============================================================
+// 8) 同步零售价(分渠道固定价)
+//    接口: POST /api/v1/price/adjustSkuOnlinePriceSyncStrategy
+//
+// 一次只处理一个 SPU,把它下面的若干 SKU 的分渠道价格一次性下发。
+//   - scenarioCode: 104(门店商品列表调价场景,抓包恒定)
+//   - actCheckType: 2
+//   - asyncUpdateStoreList: [](只改当前门店,不联动其它门店)
+//   - syncStrategyType: 1(固定价)
+//   - extend.autoUseHqPriceFormValue: 1
+// 默认把同一个价格下发到渠道 100(美团闪购)/ 200(饿了么)。
+// ============================================================
+
+interface AdjustPriceResp {
+  code: number;
+  msg?: string;
+  success?: boolean;
+  data?: {
+    createAsyncTask?: boolean;
+    adjustPriceResultList?: unknown;
+  };
+}
+
+export async function adjustSkuPrice(payload: {
+  storeId: string | number;
+  spuId: string | number;
+  skuPriceList: import('@shared/messaging').SkuPriceAdjust[];
+}): Promise<void> {
+  const channelSkuInfoList = payload.skuPriceList.map((sku) => {
+    return {
+      skuId: String(sku.skuId),
+      skuPriceStrategyList: sku.channelPrices.map((cp) => ({
+        channelId: cp.channelId,
+        syncStrategyType: 1,
+        fixedPrice: cp.fixedPrice,
+      })),
+    };
+  });
+
+  const body = {
+    storeId: Number(payload.storeId),
+    spuId: String(payload.spuId),
+    scenarioCode: 104,
+    asyncUpdateStoreList: [] as unknown[],
+    actCheckType: 2,
+    channelSkuInfoList,
+    extend: { autoUseHqPriceFormValue: 1 },
+  };
+
+  const resp = await siteFetch<AdjustPriceResp>(
+    '/api/v1/price/adjustSkuOnlinePriceSyncStrategy?yodaReady=h5&csecplatform=4&csecversion=4.2.0',
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'm-appkey': 'fe_recofesaascrm',
+        qnhreferrer: '/unifiedGoods/store/spu-list',
+      },
+      body: JSON.stringify(body),
+    },
+  );
+
+  if (resp?.code !== 0 || resp?.success === false) {
+    throw new Error(`同步零售价失败: code=${resp?.code} msg=${resp?.msg ?? 'unknown'}`);
+  }
+}
+
+// ============================================================
+// 9) 同步库存(绝对值覆盖)
+//    接口: POST /api/v1/storeempower/operate/batchContainer/stockadjustment
+//
+// 一次可处理一个门店下的多个 SKU,库存按"新值覆盖旧值"。
+//   - entityType: 3(门店)
+//   - oldQuantity 传 0 即可(后端按 newQuantity 绝对值覆盖,回执里会带真实变更)
+//   - customizeStockFlag: 1
+// ============================================================
+
+interface AdjustStockResp {
+  code: number;
+  msg?: string;
+  success?: boolean;
+  data?: {
+    code?: number;
+    msg?: string;
+    receiptNo?: string;
+    failSkuList?: unknown;
+  };
+}
+
+export async function adjustSkuStock(payload: {
+  storeId: string | number;
+  skuStockList: import('@shared/messaging').SkuStockAdjust[];
+}): Promise<{ receiptNo?: string }> {
+  const body = {
+    comment: 'WEB-门店商品列表调整库存',
+    entityId: Number(payload.storeId),
+    entityType: 3,
+    skuList: payload.skuStockList.map((sku) => ({
+      skuId: String(sku.skuId),
+      skuName: sku.skuName ?? String(sku.skuId),
+      comment: '',
+      enableExpiredCheck: false,
+      customizeStockFlag: 1,
+      batchContainerInfoList: [
+        {
+          newQuantity: sku.newQuantity,
+          oldQuantity: 0,
+          originLocationCode: '',
+        },
+      ],
+    })),
+  };
+
+  const resp = await siteFetch<AdjustStockResp>(
+    '/api/v1/storeempower/operate/batchContainer/stockadjustment?yodaReady=h5&csecplatform=4&csecversion=4.2.0',
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'm-appkey': 'fe_recofesaascrm',
+        qnhreferrer: '/unifiedGoods/store/spu-list',
+      },
+      body: JSON.stringify(body),
+    },
+  );
+
+  // 外层 code=0 且内层 data.code=0 才算成功;data.failSkuList 非空说明部分失败
+  if (resp?.code !== 0 || resp?.success === false) {
+    throw new Error(`同步库存失败: code=${resp?.code} msg=${resp?.msg ?? 'unknown'}`);
+  }
+  if (resp.data?.code != null && resp.data.code !== 0) {
+    throw new Error(`同步库存失败: ${resp.data?.msg ?? 'unknown'}`);
+  }
+  const failList = resp.data?.failSkuList;
+  if (Array.isArray(failList) && failList.length > 0) {
+    throw new Error(`同步库存部分失败: ${JSON.stringify(failList).slice(0, 200)}`);
+  }
+  return { receiptNo: resp.data?.receiptNo };
+}
+
+// ============================================================
+// 10) 门店维度补充信息:某 SPU 下各 SKU 的「门店库存 + 分渠道零售价」
+//     接口: POST /qnh-gw3/api/product/store/detail
+//
+// 主数据(图文 / 渠道 / 属性)走 tenant/detail;store/detail 只用于补齐
+// tenant 维度拿不到的两类门店覆盖层数据:
+//   - 库存:storeSkuList[].stock
+//   - 分渠道零售价:storeSkuList[].onlinePriceList[].{channelId, onlinePrice}
+//     (顶层 onlinePrice 是兜底;channelSkuList[].channelSkuPrice 也可佐证)
+// 按 skuId 聚合返回,供导出阶段写进 products/<spuId>.json。
+// ============================================================
+
+interface StoreDetailResp {
+  code: number;
+  msg?: string;
+  data?: {
+    storeSkuList?: Array<{
+      skuId: string | number;
+      stock?: string | number | null;
+      upc?: string | null;
+      upcList?: string[] | null;
+      onlinePrice?: string | number | null;
+      onlinePriceList?: Array<{
+        channelId?: number;
+        onlinePrice?: string | number | null;
+      }> | null;
+    }>;
+  };
+}
+
+export async function fetchStoreSkuInfo(payload: {
+  shopId: string | number;
+  spuId: string | number;
+}): Promise<import('@shared/messaging').StoreSkuInfo[]> {
+  const resp = await siteFetch<StoreDetailResp>(
+    '/qnh-gw3/api/product/store/detail?yodaReady=h5&csecplatform=4&csecversion=4.2.0',
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'm-appkey': 'fe_recofesaascrm',
+        qnhreferrer: '/unifiedGoods/store/edit',
+      },
+      body: JSON.stringify({ storeId: Number(payload.shopId), spuId: String(payload.spuId) }),
+    },
+  );
+
+  if (resp?.code !== 0 || !resp.data) {
+    throw new Error(`门店商品详情接口失败: ${resp?.msg ?? 'unknown'}`);
+  }
+
+  const parseNum = (v: string | number | null | undefined): number | undefined => {
+    if (v == null || v === '') return undefined;
+    const n = typeof v === 'number' ? v : Number.parseFloat(v);
+    return Number.isFinite(n) ? n : undefined;
+  };
+
+  return (resp.data.storeSkuList ?? [])
+    .filter((s) => s.skuId != null)
+    .map((s) => {
+      const channelPrices: Array<{ channelId: number; price: number }> = [];
+      const seen = new Set<number>();
+      for (const p of s.onlinePriceList ?? []) {
+        if (p.channelId == null) continue;
+        const price = parseNum(p.onlinePrice);
+        if (price == null || seen.has(p.channelId)) continue;
+        seen.add(p.channelId);
+        channelPrices.push({ channelId: p.channelId, price });
+      }
+      const upcList: string[] = [];
+      for (const u of s.upcList ?? []) if (u) upcList.push(String(u));
+      if (s.upc && !upcList.includes(String(s.upc))) upcList.push(String(s.upc));
+      return {
+        skuId: s.skuId,
+        stock: parseNum(s.stock),
+        channelPrices,
+        upcList,
+      };
+    });
 }

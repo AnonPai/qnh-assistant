@@ -13,9 +13,10 @@ import type {
   ExportManifest,
   ImportSummary,
   ProductSpu,
+  SyncSummary,
 } from './types';
 
-export type { ImportSummary } from './types';
+export type { ImportSummary, SyncSummary } from './types';
 
 /** 消息源/目标标识 */
 export const BRIDGE_SOURCE_INJECTED = 'qnh-injected';
@@ -63,6 +64,17 @@ export type ProgressEvent =
       productCurrent?: number;
       productTotal?: number;
     }
+  | {
+      /** 「同步库存 / 零售价」进度 */
+      kind: 'sync';
+      phase: 'parse' | 'sku';
+      current: number;
+      total: number;
+      message?: string;
+      /** 已处理 / 总商品数,UI 用它做"商品进度"展示 */
+      productCurrent?: number;
+      productTotal?: number;
+    }
   /**
    * 离散的商品级日志,UI 端用来渲染"滚动日志列表"。
    * 进度条与计数仍由 export/import 事件驱动,这个只追加文本行。
@@ -76,7 +88,7 @@ export type ProgressEvent =
       /** 简短文本,渲染时单行省略 */
       text: string;
     }
-  | { kind: 'done'; result: ExportResult | ImportSummary }
+  | { kind: 'done'; result: ExportResult | ImportSummary | SyncSummary }
   | { kind: 'error'; message: string };
 
 export interface ExportResult {
@@ -91,12 +103,45 @@ export type InjectedCommand =
   | { id: string; type: 'SWITCH_SHOP'; payload: { shopId: string | number } }
   | { id: string; type: 'FETCH_PRODUCT_LIST'; payload: { shopId: string | number; pageNo: number; pageSize: number; spuName?: string; upcList?: string[]; skuIdList?: Array<string | number>; /** 'tenant' = 租户主档(几万条);'store' = 门店在售(默认导出走这个) */ scope?: 'tenant' | 'store' } }
   | { id: string; type: 'FETCH_PRODUCT_DETAIL'; payload: { shopId: string | number; spuId: string | number } }
+  /** 门店维度补充信息:某 SPU 下各 SKU 的门店库存 + 分渠道零售价(store/detail) */
+  | { id: string; type: 'FETCH_STORE_SKU_INFO'; payload: { shopId: string | number; spuId: string | number } }
   | { id: string; type: 'FETCH_CATEGORY_TREE'; payload: { shopId: string | number } }
   | { id: string; type: 'FETCH_FRONT_CATEGORY_TREE'; payload: { shopId: string | number } }
   | { id: string; type: 'FETCH_SHOP_INFO' }
   | { id: string; type: 'UPLOAD_MEDIA'; payload: { shopId: string | number; kind: 'image' | 'video'; mime: string; bytesBase64: string } }
   | { id: string; type: 'CREATE_PRODUCT'; payload: { shopId: string | number; product: ProductSpu; mediaIdMap: Record<string, UploadedMedia>; targetCategoryPath: Array<string | number>; childSkuMap?: Record<string, ChildSkuMapping>; frontCategoryIdRemap?: Record<string, string> } }
-  | { id: string; type: 'UPDATE_PRODUCT'; payload: { product: ProductSpu; mediaIdMap: Record<string, UploadedMedia>; targetSpuId: string | number; targetDetail: unknown; frontCategoryIdRemap?: Record<string, string>; existingMediaIdMap?: Record<string, UploadedMedia>; childSkuMap?: Record<string, ChildSkuMapping> } };
+  | { id: string; type: 'UPDATE_PRODUCT'; payload: { product: ProductSpu; mediaIdMap: Record<string, UploadedMedia>; targetSpuId: string | number; targetDetail: unknown; frontCategoryIdRemap?: Record<string, string>; existingMediaIdMap?: Record<string, UploadedMedia>; childSkuMap?: Record<string, ChildSkuMapping> } }
+  /** 同步零售价:把一个 SPU 下若干 SKU 的分渠道固定价推到目标门店(adjustSkuOnlinePriceSyncStrategy) */
+  | { id: string; type: 'ADJUST_SKU_PRICE'; payload: { storeId: string | number; spuId: string | number; skuPriceList: SkuPriceAdjust[] } }
+  /** 同步库存:把一个门店下若干 SKU 的库存绝对值推到目标门店(batchContainer/stockadjustment) */
+  | { id: string; type: 'ADJUST_SKU_STOCK'; payload: { storeId: string | number; skuStockList: SkuStockAdjust[] } };
+
+/** 单个 SKU 的分渠道零售价调整入参 */
+export interface SkuPriceAdjust {
+  skuId: string | number;
+  /** 分渠道固定价;每个渠道可不同价(美团闪购 100 / 饿了么 200 等) */
+  channelPrices: Array<{ channelId: number; fixedPrice: number }>;
+}
+
+/** 单个 SKU 的库存调整入参 */
+export interface SkuStockAdjust {
+  skuId: string | number;
+  /** SKU 名称(接口要求带,用于回执展示;缺省用 skuId) */
+  skuName?: string;
+  /** 目标库存绝对值 */
+  newQuantity: number;
+}
+
+/** 门店维度某 SKU 的库存 + 分渠道零售价(FETCH_STORE_SKU_INFO 返回项) */
+export interface StoreSkuInfo {
+  skuId: string | number;
+  /** 门店库存(取不到为 undefined) */
+  stock?: number;
+  /** 分渠道零售价;channelId → 价格(元) */
+  channelPrices: Array<{ channelId: number; price: number }>;
+  /** 该 SKU 的 UPC 列表(用于和导出包里的 SKU 对齐) */
+  upcList: string[];
+}
 
 /** 父商品创建时,把组合装 childSkuList 里的源 spuId/skuId 替换成目标店里新建后的 ID */
 export interface ChildSkuMapping {

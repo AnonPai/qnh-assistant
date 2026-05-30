@@ -100,6 +100,13 @@ export function ImportPanel() {
               <code style={{ fontSize: 11 }}>{summary.videoMappingFileName}</code>
             </div>
           )}
+          {summary.logFileName && (
+            <div style={{ marginTop: 6, lineHeight: 1.5 }}>
+              排查日志已写入源目录:
+              <br />
+              <code style={{ fontSize: 11 }}>{summary.logFileName}</code>
+            </div>
+          )}
         </div>
       )}
 

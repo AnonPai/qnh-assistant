@@ -25,6 +25,7 @@ import type {
   ProductSpu,
 } from '@shared/types';
 import type { ProgressEvent, ShopInfo } from '@shared/messaging';
+import type { StoreSkuInfo } from '@shared/messaging';
 import type { CallInjected } from './index';
 import {
   ExportProgressFile,
@@ -299,6 +300,10 @@ export async function runExport({
       payload: { shopId: sourceShopId, spuId: item.spuId },
     });
 
+    // 门店维度补充:库存 + 分渠道零售价(tenant/detail 拿不到这两类门店覆盖层数据)。
+    // 失败不影响主流程 —— 拿不到就保持 stock/channelPrices 为空,同步阶段会按"跳过"处理。
+    await enrichWithStoreSkuInfo(spu, sourceShopId, callInjected);
+
     const allPending =
       (spu.raw?.__pendingMedia as Array<{ url: string; kind: 'image' | 'video'; ref: string }>) ?? [];
     // includeImages = false 时跳过图片下载(图片 URL 保留在 spu json 里,
@@ -568,8 +573,50 @@ function normalizeUpc(u: string | number | null | undefined): string {
   return String(u).trim().replace(/\s+/g, '');
 }
 
+/**
+ * 用门店维度 store/detail 给 spu.skus 补齐「库存 + 分渠道零售价」。
+ * 按 skuId 关联(导出当前店时,sourceSkuId 就是该店的真实 skuId);
+ * skuId 对不上时按 UPC 兜底关联。失败时静默跳过(stock/channelPrices 留空)。
+ */
+async function enrichWithStoreSkuInfo(
+  spu: ProductSpu,
+  sourceShopId: string | number,
+  callInjected: CallInjected,
+): Promise<void> {
+  let storeSkus: StoreSkuInfo[];
+  try {
+    storeSkus = await callInjected<StoreSkuInfo[]>({
+      type: 'FETCH_STORE_SKU_INFO',
+      payload: { shopId: sourceShopId, spuId: spu.sourceSpuId },
+    });
+  } catch (e) {
+    log.warn(`门店库存/价格补充失败,跳过: spu=${spu.sourceSpuId}`, e);
+    return;
+  }
+  if (!storeSkus || storeSkus.length === 0) return;
+
+  const byId = new Map<string, StoreSkuInfo>();
+  const byUpc = new Map<string, StoreSkuInfo>();
+  for (const s of storeSkus) {
+    byId.set(String(s.skuId), s);
+    for (const u of s.upcList ?? []) {
+      const n = String(u).trim();
+      if (n) byUpc.set(n, s);
+    }
+  }
+
+  for (const sku of spu.skus ?? []) {
+    let info = sku.sourceSkuId != null ? byId.get(String(sku.sourceSkuId)) : undefined;
+    if (!info && sku.outerSkuCode) info = byUpc.get(String(sku.outerSkuCode).trim());
+    if (!info) continue;
+    if (info.stock != null) sku.stock = info.stock;
+    if (info.channelPrices.length > 0) sku.channelPrices = info.channelPrices;
+  }
+}
+
 /** 收集组合装的子 SPU id */
-function collectChildSpuIds(spu: ProductSpu): Array<string | number> {  const detail = spu.raw?.detail as
+function collectChildSpuIds(spu: ProductSpu): Array<string | number> {
+  const detail = spu.raw?.detail as
     | { skus?: Array<{ childSkuList?: Array<{ spuId?: string | number }> | null }> }
     | undefined;
   if (!detail?.skus) return [];

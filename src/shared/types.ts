@@ -38,8 +38,13 @@ export interface ProductSku {
   price: number;
   /** 原价(元) */
   originPrice?: number;
-  /** 库存 */
+  /** 库存(门店维度;导出时从 store/detail 的 storeSkuList[].stock 取) */
   stock?: number;
+  /**
+   * 分渠道零售价(门店维度;导出时从 store/detail 的 onlinePriceList 取)。
+   * 「同步库存价格」同步零售价时优先用它;为空时回退到建议售价 price。
+   */
+  channelPrices?: Array<{ channelId: number; price: number }>;
   /** 第三方编码 */
   outerSkuCode?: string;
   /** 该 SKU 独有图片(如不同颜色),引用 MediaAsset.hash */
@@ -117,6 +122,35 @@ export interface ImportResultItem {
   durationMs?: number;
 }
 
+/** 「同步库存 / 零售价」整体结果(从导出目录把每个 SKU 的价格/库存推到目标门店) */
+export interface SyncSummary {
+  /** 判别标记,便于 UI 在 done 事件里和导出 / 导入结果区分 */
+  kind: 'sync';
+  /** 目标门店 */
+  shopId: string | number;
+  shopName?: string;
+  /** 本次是否同步了库存 / 零售价 */
+  syncedStock: boolean;
+  syncedPrice: boolean;
+  /** products 目录里的商品总数 / 实际处理数 */
+  productTotal: number;
+  productProcessed: number;
+  /** 在目标门店没匹配到(UPC + 商品名都没命中)的商品数 */
+  productNotFound: number;
+  /** 零售价:成功 / 失败 / 跳过(无有效价格)的 SKU 数 */
+  priceOk: number;
+  priceFailed: number;
+  priceSkipped: number;
+  /** 库存:成功 / 失败 / 跳过(导出包未带库存)的 SKU 数 */
+  stockOk: number;
+  stockFailed: number;
+  stockSkipped: number;
+  startedAt: string;
+  finishedAt: string;
+  /** 首个错误信息(便于 UI 直接展示) */
+  firstError?: string;
+}
+
 /** 整体导入结果 */
 export interface ImportSummary {
   total: number;
@@ -132,4 +166,6 @@ export interface ImportSummary {
   videoMappingFileName?: string;
   /** 需要手动补传的视频条目数(含一个商品多个视频) */
   videoMappingCount?: number;
+  /** 排查用:导入全过程日志落盘文件名(写在源目录根) */
+  logFileName?: string;
 }

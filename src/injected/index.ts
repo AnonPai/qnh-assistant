@@ -52,6 +52,9 @@ window.addEventListener('message', async (ev) => {
       case 'FETCH_PRODUCT_DETAIL':
         result = await api.fetchProductDetail(cmd.payload);
         break;
+      case 'FETCH_STORE_SKU_INFO':
+        result = await api.fetchStoreSkuInfo(cmd.payload);
+        break;
       case 'UPLOAD_MEDIA':
         result = await api.uploadMedia(cmd.payload);
         break;
@@ -62,6 +65,12 @@ window.addEventListener('message', async (ev) => {
         result = await api.updateProduct(
           cmd.payload as Parameters<typeof api.updateProduct>[0],
         );
+        break;
+      case 'ADJUST_SKU_PRICE':
+        result = await api.adjustSkuPrice(cmd.payload);
+        break;
+      case 'ADJUST_SKU_STOCK':
+        result = await api.adjustSkuStock(cmd.payload);
         break;
       default:
         throw new Error(`未实现的指令: ${(cmd as { type: string }).type}`);

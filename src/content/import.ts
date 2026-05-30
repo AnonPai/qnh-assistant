@@ -91,6 +91,13 @@ interface RunImportArgs {
    */
   syncImages?: boolean;
   /**
+   * 名称一致但 UPC 不一致时是否走"修改"。默认 false。
+   * - false(默认):目标店已有同名商品但 UPC 对不上 → 跳过,不新建也不修改(避免误覆盖/建重复)
+   * - true:把这种"仅同名命中"也当作已存在,走 update 路径(先比对,不一致才改)
+   * 仅在全量模式下生效;增量模式同名一律跳过。
+   */
+  updateOnNameMatch?: boolean;
+  /**
    * 可选:用户人工维护的「店内分类映射」文件(TSV)。
    * 检测到目标店分类与源端不齐时,把已自动匹配 + 缺失的清单写到源目录;
    * 用户编辑好后下次再传。文件格式见 docs(以 # 开头的为注释,空目标列视为未填)。
@@ -109,6 +116,7 @@ export async function runImport({
   mode = 'full',
   confirmMode = 'auto',
   syncImages = true,
+  updateOnNameMatch = false,
   frontCategoryMappingFile,
   requestConfirm,
   cancelFlag,
@@ -116,16 +124,27 @@ export async function runImport({
   callInjected,
 }: RunImportArgs) {
   const startedAt = new Date().toISOString();
-  log.info(`开始导入,模式: ${mode},执行: ${confirmMode},图片同步: ${syncImages ? '是' : '否'}`);
+  log.info(
+    `开始导入,模式: ${mode},执行: ${confirmMode},图片同步: ${syncImages ? '是' : '否'},` +
+      `同名异 UPC 修改: ${updateOnNameMatch ? '是' : '否'}`,
+  );
+
+  // 排查用:把整个导入过程的日志攒到内存里,结束时(成功 / 失败 / 取消 / 中断)都落一份
+  // .log 到源目录根。popup UI 只保留最近 N 条 ring buffer,30k 商品时早期日志会被冲掉,
+  // 出问题后这份完整落盘日志才是排查依据。
+  const runLog: string[] = [];
+  const recordLog = (level: string, text: string) => {
+    const ts = new Date().toISOString();
+    runLog.push(`[${ts}] [${level.toUpperCase()}] ${text}`);
+  };
+  const logFileName = buildImportLogFileName();
+  recordLog('info', `开始导入 模式=${mode} 执行=${confirmMode} 图片同步=${syncImages ? '是' : '否'} 同名异UPC修改=${updateOnNameMatch ? '是' : '否'}`);
+
   if (confirmMode === 'manual' && !requestConfirm) {
     throw new Error('手动模式必须提供 requestConfirm');
   }
 
-  // ---- 探针店:仍有少数接口(创建商品、上传图片、查询商品列表/详情、店内分类树)
-  // 必须带一个 storeId 上下文。导入面向"租户主档",但这些接口的语义是"以某门店身份调用",
-  // 因此自动取当前账号下第一家门店做探针店即可。用户层面已经不需要选门店了。
-  const probeShopId = await resolveProbeShopId(callInjected);
-  log.info(`探针店:${probeShopId}(无需用户选择,默认取首家)`);  // 商品级日志计数:每处理完一个商品(无论成功/失败/跳过/修改)就发一条 'log' 事件,
+  // 商品级日志计数:每处理完一个商品(无论成功/失败/跳过/修改)就发一条 'log' 事件,
   // UI 端按 ring buffer 展示最近 N 条,避免 30k 商品撑爆 DOM。
   let logIndex = 0;
   const emitLog = (
@@ -133,6 +152,7 @@ export async function runImport({
     text: string,
   ) => {
     logIndex++;
+    recordLog(level, text);
     onProgress({
       kind: 'log',
       level,
@@ -140,6 +160,15 @@ export async function runImport({
       text,
     });
   };
+
+  try {
+
+  // ---- 探针店:仍有少数接口(创建商品、上传图片、查询商品列表/详情、店内分类树)
+  // 必须带一个 storeId 上下文。导入面向"租户主档",但这些接口的语义是"以某门店身份调用",
+  // 因此自动取当前账号下第一家门店做探针店即可。用户层面已经不需要选门店了。
+  const probeShopId = await resolveProbeShopId(callInjected);
+  log.info(`探针店:${probeShopId}(无需用户选择,默认取首家)`);
+  recordLog('info', `探针店=${probeShopId}`);
 
   // ---- 1) 解析源目录 ----
   onProgress({ kind: 'import', phase: 'parse', current: 0, total: 1, message: '读取数据目录' });
@@ -184,6 +213,7 @@ export async function runImport({
   // 索引出所有用到的 media hash(从 raw 也提)—— 仅用于后续视频补传清单统计
   const usedHashes = collectMediaHashes(products);
   log.info(`商品 ${products.length} 个,引用媒体 ${usedHashes.size} 个`);
+  recordLog('info', `源目录: ${sourceDir.name} · 商品 ${products.length} 个,引用媒体 ${usedHashes.size} 个`);
 
   // ---- 1.5) 校验目标租户的"店内分类"是否齐全(跨租户导入必走) ----
   // 用导出包里所有商品引用的店内分类 namePath,跟目标店的店内分类树匹配。
@@ -216,6 +246,10 @@ export async function runImport({
     `店内分类映射就绪:ID ${Object.keys(frontCategoryIdRemap).length} 条,` +
       `路径改写 ${frontCategoryPathRemap.size} 条`,
     frontCategoryIdRemap,
+  );
+  recordLog(
+    'info',
+    `店内分类校验通过:ID 映射 ${Object.keys(frontCategoryIdRemap).length} 条,路径改写 ${frontCategoryPathRemap.size} 条`,
   );
 
   // ---- 2) 商品创建 / 修改(per-product) ----
@@ -313,6 +347,43 @@ export async function runImport({
         continue;
       }
 
+      // 全量模式下,UPC 没命中但「商品名」命中:目标店已有同名商品。
+      // 默认行为(updateOnNameMatch = false):不能走 update(没有可靠的 UPC 对应关系,
+      // 贸然改会改错商品),也不能走 create(否则会建出重复的同名商品),直接跳过并提示。
+      // 开启 updateOnNameMatch 后:把"仅同名命中"也当作已存在,继续往下走 update 路径
+      // (后面 willUpdate 会接管,先比对、不一致才真正调 update)。
+      if (matched && mode === 'full' && matched.reason === '同名' && !updateOnNameMatch) {
+        log.warn(`[全量] 目标店已存在同名商品,跳过新建: ${spu.name} → 目标 SPU ${matched.spuId}`);
+        try {
+          const skuMap = await buildSkuMapping(
+            callInjected,
+            spu,
+            probeShopId,
+            matched.spuId,
+          );
+          childSkuMap[String(spu.sourceSpuId)] = {
+            targetSpuId: matched.spuId,
+            skuMap,
+          };
+        } catch (e) {
+          log.warn(`回查目标 SKU 映射失败,组合装可能受影响: ${spu.name}`, e);
+          childSkuMap[String(spu.sourceSpuId)] = {
+            targetSpuId: matched.spuId,
+            skuMap: {},
+          };
+        }
+        items.push({
+          sourceSpuId: spu.sourceSpuId,
+          name: spu.name,
+          status: 'skipped',
+          targetSpuId: matched.spuId,
+          errorMessage: '已存在相同名称商品(UPC 不一致,未新建)',
+          durationMs: Date.now() - startTs,
+        });
+        emitLog('warn', `跳过 ${spu.name} · 已存在相同名称商品(UPC 不一致)`);
+        continue;
+      }
+
       // (b) 类目映射
       const targetCategoryPath = resolveCategoryPath(spu, mapping);
       if (!targetCategoryPath) {
@@ -327,12 +398,18 @@ export async function runImport({
         continue;
       }
 
-      // 全量 + UPC 命中 → 走"修改"路径(走 update 接口)
+      // 全量 + 命中已存在 → 走"修改"路径(走 update 接口)。
+      //   - UPC 命中:一定走 update
+      //   - 仅同名命中:只有开启 updateOnNameMatch 时才走 update(否则上面已 continue 跳过)
       // update body 里 picUrlList / picContentList / videoInfo / specialPictureList 都要写,
       // 与 create 一样会覆盖目标店现有图片字段。要让"源端图改了就改、没改就不动"
       // 这个语义成立,必须先上传源端图、再让 buildTenantSpuV2(update) 用源端 detail
       // 派生 picUrlList,跟 create 路径保持一致。
-      const willUpdate = !!matched && matched.reason.startsWith('UPC=') && mode === 'full';
+      const willUpdate =
+        !!matched &&
+        mode === 'full' &&
+        (matched.reason.startsWith('UPC=') ||
+          (matched.reason === '同名' && updateOnNameMatch));
       let targetDetailForUpdate: unknown;
       if (willUpdate && matched) {
         targetDetailForUpdate = await fetchTargetDetailForUpdate(
@@ -578,8 +655,57 @@ export async function runImport({
     items,
     videoMappingFileName,
     videoMappingCount: videoEntries.length || undefined,
+    logFileName,
   };
+  recordLog(
+    'info',
+    `导入结束 共${summary.total} 新建${summary.succeeded} 修改${summary.updated} ` +
+      `跳过${summary.skipped} 失败${summary.failed}${cancelFlag.cancelled ? ' (已取消)' : ''}`,
+  );
+  // 逐条商品结果也落进日志,排查时能精确定位每个商品的归宿
+  for (const it of items) {
+    recordLog(
+      it.status === 'failed' ? 'error' : 'detail',
+      `· ${it.status} | ${it.name} | sourceSpuId=${it.sourceSpuId}` +
+        (it.targetSpuId != null ? ` → targetSpuId=${it.targetSpuId}` : '') +
+        (it.errorMessage ? ` | ${it.errorMessage}` : ''),
+    );
+  }
+  await flushRunLog(sourceDir, logFileName, runLog);
   onProgress({ kind: 'done', result: summary });
+
+  } catch (e) {
+    // 主流程异常(如店内分类缺失而提前终止):把已攒下的日志连同错误一并落盘,
+    // 这正是最需要排查的场景。落盘失败不掩盖原始错误。
+    recordLog('error', `导入流程异常终止: ${(e as Error).message}`);
+    try {
+      await flushRunLog(sourceDir, logFileName, runLog);
+    } catch (writeErr) {
+      log.warn('导入日志落盘失败', writeErr);
+    }
+    throw e;
+  }
+}
+
+/** 排查日志文件名:qnh-import-<时间戳>.log */
+function buildImportLogFileName(): string {
+  const ts = new Date().toISOString().replace(/[:.]/g, '-');
+  return `qnh-import-${ts}.log`;
+}
+
+/** 把内存里攒的导入日志写到源目录根,失败只告警不影响主流程 */
+async function flushRunLog(
+  dir: FileSystemDirectoryHandle,
+  fileName: string,
+  lines: string[],
+): Promise<void> {
+  try {
+    // 加 BOM,Windows 记事本打开 UTF-8 中文不乱码
+    await writeTextFile(dir, fileName, '\uFEFF' + lines.join('\r\n') + '\r\n');
+    log.info(`导入日志已写入: ${fileName}(共 ${lines.length} 行)`);
+  } catch (e) {
+    log.warn('导入日志落盘失败', e);
+  }
 }
 
 /** 收集 spu 中所有 media://${hash} 引用 */
@@ -1266,10 +1392,13 @@ async function triggerTxtDownload(
 /**
  * 按 UPC 精准查询目标店是否已存在该商品。
  *   - 用 page-query-spu 的 upcList 过滤,在线计算,不预拉全店清单
- *   - 命中即返回 { spuId, reason: 'UPC=xxx' };找不到再用商品名做一次模糊查询兜底
+ *   - 命中即返回 { spuId, reason: 'UPC=xxx' };找不到再用商品名兜底
+ *   - 名字兜底:后端 spuName 是关键词模糊检索,且"关键词超上限只取前 3 个词",
+ *     返回结果可能多个且不一定同名;这里翻页拉回候选,再用「去空格精确匹配」挑出真正同名项,
+ *     命中返回 { spuId, reason: '同名' }
  *   - 找不到匹配 → 返回 null,调用方走"创建"路径
  */
-async function lookupExistingForProduct(
+export async function lookupExistingForProduct(
   callInjected: CallInjected,
   targetShopId: string | number,
   spu: ProductSpu,
@@ -1304,18 +1433,30 @@ async function lookupExistingForProduct(
     }
   }
 
-  // 3) 兜底:商品名模糊查询(后端是 spuName like '%xxx%',这里只取前 20 条做精确名比对)
+  // 3) 兜底:商品名查询。
+  //    后端 spuName 是按关键词 like 检索,且有"关键词个数超出上限,只取前 3 个关键词"
+  //    的限制 —— 名字一长就只用前 3 个词模糊匹配,因此返回结果往往是多个、且不一定同名。
+  //    这里翻页把候选拉回来,在程序内用「去空格精确匹配」(normalizeName)挑出真正同名的那一个。
   if (spu.name) {
-    const page = await callInjected<{
-      list: Array<{ spuId: string | number; name: string; upcList: string[] }>;
-      total: number;
-    }>({
-      type: 'FETCH_PRODUCT_LIST',
-      payload: { shopId: targetShopId, pageNo: 1, pageSize: 20, spuName: spu.name },
-    });
     const target = normalizeName(spu.name);
-    const exact = page.list.find((it) => normalizeName(it.name) === target);
-    if (exact) return { spuId: exact.spuId, reason: '同名' };
+    if (target) {
+      const pageSize = 50;
+      const maxPages = 10; // 最多翻 500 条:名字过于通用时也不至于无限翻页
+      for (let pageNo = 1; pageNo <= maxPages; pageNo++) {
+        const page = await callInjected<{
+          list: Array<{ spuId: string | number; name: string; upcList: string[] }>;
+          total: number;
+        }>({
+          type: 'FETCH_PRODUCT_LIST',
+          payload: { shopId: targetShopId, pageNo, pageSize, spuName: spu.name },
+        });
+        const exact = page.list.find((it) => normalizeName(it.name) === target);
+        if (exact) return { spuId: exact.spuId, reason: '同名' };
+        // 没翻到底就继续下一页;后端 total 可用时按 total 截断,避免空翻
+        if (page.list.length < pageSize) break;
+        if (page.total && pageNo * pageSize >= page.total) break;
+      }
+    }
   }
 
   return null;

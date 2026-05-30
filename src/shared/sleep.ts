@@ -22,4 +22,6 @@ export const THROTTLE = {
   IMPORT_PRODUCT: [500, 1500],
   /** 导入 · 单张图片上传之间的随机间隔 */
   IMPORT_MEDIA_UPLOAD: [350, 800],
+  /** 同步库存/零售价 · 每个商品(一次价格 + 一次库存调用)处理完之后的随机间隔 */
+  SYNC_PRODUCT: [300, 800],
 } as const satisfies Record<string, readonly [number, number]>;

@@ -21,16 +21,19 @@ import {
   callInjected,
   startExport,
   startImport,
+  startSync,
   subscribeProgress,
 } from './index';
-import { openExportForm, openImportForm } from './config-forms';
+import { openExportForm, openImportForm, openSyncForm } from './config-forms';
 
 const log = createLogger('inpage');
 
 const BTN_EXPORT_TEXT = '📦 导出本店商品';
 const BTN_IMPORT_TEXT = '📥 导入商品';
+const BTN_SYNC_TEXT = '🔄 同步库存价格';
 const MARK_EXPORT_BTN = 'qnh-export-btn';
 const MARK_IMPORT_BTN = 'qnh-import-btn';
+const MARK_SYNC_BTN = 'qnh-sync-btn';
 const MARK_PANEL = 'qnh-progress-panel';
 
 /**
@@ -63,6 +66,7 @@ export function mountInPageUI() {
     scheduled = true;
     requestAnimationFrame(() => {
       scheduled = false;
+      injectSyncButton();
       injectExportButton();
       injectImportButton();
     });
@@ -120,9 +124,56 @@ function injectExportButton() {
   log.info('已注入导出按钮', { toolbarClass: toolbar.className });
 }
 
+/**
+ * 注入「同步库存价格」按钮到导出按钮的左边(同样只在门店商品列表显示)。
+ * 锚点优先用已注入的导出按钮 wrapper,这样始终位于"导出本店商品"左侧;
+ * 导出按钮还没注入时回退到「新增商品」按钮。
+ */
+function injectSyncButton() {
+  if (!isExportRoute()) {
+    document.querySelector(`[data-qnh="${MARK_SYNC_BTN}"]`)?.remove();
+    return;
+  }
+  if (document.querySelector(`[data-qnh="${MARK_SYNC_BTN}"]`)) return;
+
+  const exportWrapper = document.querySelector<HTMLElement>(`[data-qnh="${MARK_EXPORT_BTN}"]`);
+  const anchor = exportWrapper ?? findAddProductButton();
+  if (!anchor) return;
+  const toolbar = anchor.parentElement;
+  if (!toolbar) return;
+
+  const wrapper = document.createElement(anchor.tagName.toLowerCase());
+  wrapper.className = anchor.className;
+  wrapper.dataset.qnh = MARK_SYNC_BTN;
+
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.textContent = BTN_SYNC_TEXT;
+  btn.style.cssText = [
+    'display:inline-flex',
+    'align-items:center',
+    'gap:4px',
+    'height:32px',
+    'padding:0 14px',
+    'border:1px solid #13c2c2',
+    'background:#e6fffb',
+    'color:#08979c',
+    'border-radius:4px',
+    'font-size:13px',
+    'cursor:pointer',
+    'line-height:1',
+  ].join(';');
+  btn.addEventListener('mouseenter', () => (btn.style.background = '#b5f5ec'));
+  btn.addEventListener('mouseleave', () => (btn.style.background = '#e6fffb'));
+  btn.addEventListener('click', onSyncClick);
+
+  wrapper.appendChild(btn);
+  toolbar.insertBefore(wrapper, anchor);
+  log.info('已注入同步库存价格按钮');
+}
+
 /** 注入导入按钮到「新增商品」按钮的左边(仅主档列表) */
-function injectImportButton() {
-  if (!isImportRoute()) {
+function injectImportButton() {  if (!isImportRoute()) {
     document.querySelector(`[data-qnh="${MARK_IMPORT_BTN}"]`)?.remove();
     return;
   }
@@ -323,6 +374,33 @@ async function onExportClick() {
 }
 
 /* ============================================================
+   同步库存价格按钮:打开表单 → 选门店 + 同步项 + 数据源目录
+   ============================================================ */
+
+async function onSyncClick() {
+  const result = await openSyncForm({ callInjected });
+  if (!result) return; // 用户取消
+
+  const items: string[] = [];
+  if (result.syncStock) items.push('库存');
+  if (result.syncPrice) items.push('零售价');
+
+  showPanel({
+    title: `同步 ${result.shop.shopName ?? result.shop.shopId} · 准备中`,
+    body: `数据源:${result.sourceDir.name} · 同步${items.join(' / ')}`,
+    tone: 'info',
+  });
+
+  startSync({
+    shopId: result.shop.shopId,
+    shopName: result.shop.shopName,
+    syncStock: result.syncStock,
+    syncPrice: result.syncPrice,
+    sourceDir: result.sourceDir,
+  });
+}
+
+/* ============================================================
    导入按钮:打开单页表单 → 用户填完一次性提交
    ============================================================ */
 
@@ -335,6 +413,8 @@ async function onImportClick() {
     body: `源目录:${result.sourceDir.name} · ${result.mode === 'full' ? '全量' : '增量'} · ${
       result.confirmMode === 'auto' ? '自动' : '手动'
     } · ${result.syncImages ? '同步图片' : '不同步图片'}${
+      result.mode === 'full' && result.updateOnNameMatch ? ' · 同名异UPC也改' : ''
+    }${
       result.frontCategoryMappingFile ? ` · 分类映射:${result.frontCategoryMappingFile.name}` : ''
     }`,
     tone: 'info',
@@ -347,6 +427,7 @@ async function onImportClick() {
     mode: result.mode,
     confirmMode: result.confirmMode,
     syncImages: result.syncImages,
+    updateOnNameMatch: result.updateOnNameMatch,
     frontCategoryMappingFile: result.frontCategoryMappingFile,
     requestConfirm: result.confirmMode === 'manual' ? requestImportConfirm : undefined,
   });
@@ -470,7 +551,40 @@ function onProgress(root: ShadowRoot, e: ProgressEvent) {
       barEl.style.width = `${Math.min(100, (pCur / pTotal) * 100)}%`;
     }
     cardEl.dataset.tone = 'info';
+  } else if (e.kind === 'sync') {
+    const phaseLabel = {
+      parse: '读取数据源',
+      sku: '同步库存/零售价',
+    }[e.phase];
+    const pCur = e.productCurrent ?? (e.phase === 'sku' ? e.current : 0);
+    const pTotal = e.productTotal ?? (e.phase === 'sku' ? e.total : 0);
+    titleEl.textContent = `同步中 · ${phaseLabel}`;
+    bodyEl.textContent = `商品 ${pCur} / ${pTotal || '?'}${e.message ? ` · ${e.message}` : ''}`;
+    if (pTotal > 0) {
+      barEl.style.width = `${Math.min(100, (pCur / pTotal) * 100)}%`;
+    }
+    cardEl.dataset.tone = 'info';
   } else if (e.kind === 'done') {
+    if ('kind' in e.result) {
+      const r = e.result;
+      const failed = r.priceFailed > 0 || r.stockFailed > 0;
+      titleEl.textContent = failed ? '同步完成(有失败)' : '同步完成 ✓';
+      const parts = [`商品 ${r.productProcessed}/${r.productTotal}`];
+      if (r.productNotFound > 0) parts.push(`未匹配 ${r.productNotFound}`);
+      if (r.syncedPrice) {
+        parts.push(`零售价 成功 ${r.priceOk}·失败 ${r.priceFailed}·跳过 ${r.priceSkipped}`);
+      }
+      if (r.syncedStock) {
+        parts.push(`库存 成功 ${r.stockOk}·失败 ${r.stockFailed}·跳过 ${r.stockSkipped}`);
+      }
+      let body = parts.join('\n');
+      if (r.firstError) body += `\n首个错误: ${r.firstError}`;
+      bodyEl.textContent = body;
+      bodyEl.style.whiteSpace = 'pre-wrap';
+      barEl.style.width = '100%';
+      cardEl.dataset.tone = failed ? 'error' : 'success';
+      return;
+    }
     if ('fileName' in e.result) {
       titleEl.textContent = '导出完成 ✓';
       bodyEl.textContent = `已生成 ${e.result.fileName},请检查下载目录。`;
