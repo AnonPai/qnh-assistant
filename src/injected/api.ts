@@ -35,12 +35,67 @@ import type { ShopBrief, ShopInfo } from '@shared/messaging';
 
 // ---- 通用工具 ----
 
+const DEFAULT_CSEC_VERSION = '4.2.4';
+let cachedCsecVersion: string | undefined;
+
+function isCsecVersion(value: string | null | undefined): value is string {
+  return !!value && /^\d+(?:\.\d+){1,3}$/.test(value);
+}
+
+function compareVersion(a: string, b: string): number {
+  const aa = a.split('.').map((item) => Number(item));
+  const bb = b.split('.').map((item) => Number(item));
+  const len = Math.max(aa.length, bb.length);
+  for (let i = 0; i < len; i += 1) {
+    const diff = (aa[i] ?? 0) - (bb[i] ?? 0);
+    if (diff !== 0) return diff;
+  }
+  return 0;
+}
+
+function rememberCsecVersion(value: string | null | undefined) {
+  if (!isCsecVersion(value)) return;
+  if (!cachedCsecVersion || compareVersion(value, cachedCsecVersion) > 0) {
+    cachedCsecVersion = value;
+  }
+}
+
+function rememberCsecVersionFromUrl(rawUrl: string) {
+  try {
+    const url = new URL(rawUrl, location.origin);
+    rememberCsecVersion(url.searchParams.get('csecversion'));
+  } catch {
+    // ignore invalid resource names
+  }
+}
+
+function detectCsecVersionFromPerformance(): string | undefined {
+  for (const entry of performance.getEntriesByType('resource')) {
+    rememberCsecVersionFromUrl((entry as PerformanceResourceTiming).name);
+  }
+  return cachedCsecVersion;
+}
+
+function currentCsecVersion(): string {
+  return cachedCsecVersion ?? detectCsecVersionFromPerformance() ?? DEFAULT_CSEC_VERSION;
+}
+
+function qnhApiPath(path: string): string {
+  const url = new URL(path, location.origin);
+  url.searchParams.set('yodaReady', 'h5');
+  url.searchParams.set('csecplatform', '4');
+  url.searchParams.set('csecversion', currentCsecVersion());
+  return `${url.pathname}${url.search}`;
+}
+
 /**
  * 站内 fetch:同 origin 默认带 cookie。
  * 如果遇到签名拦截器没自动生效的情况,可以改成 await window.fetch(...)
  * 或者寻找页面上的 ajax 工具(如 window.__APP__.request)。
  */
 async function siteFetch<T = unknown>(input: RequestInfo, init?: RequestInit): Promise<T> {
+  if (typeof input === 'string') rememberCsecVersionFromUrl(input);
+  else rememberCsecVersionFromUrl(input.url);
   const res = await fetch(input, {
     credentials: 'include',
     ...init,
@@ -71,29 +126,31 @@ export async function fetchShopInfo(): Promise<ShopInfo> {
 
 // ============================================================
 // 1.5) 当前账号下的门店列表
-//      接口: POST /api/v1/common/poi/queryCityPoiListWithPermission
-//      详见 docs/api-captures/queryCityPoiListWithPermission.md
+//      接口: POST /core/poi/b/store/selector/agg-by-city
 // ============================================================
-interface QueryCityPoiResp {
+interface StoreSelectorAggByCityResp {
   code: number;
   msg?: string;
-  success?: boolean;
   data?: Array<{
-    cityCode?: string;
+    cityCode?: number | string;
     cityName?: string;
-    poiList?: Array<{
-      poiId: number | string;
-      poiName: string;
-      cityName?: string;
-      status?: string;
-      statusCode?: string;
+    storeList?: Array<{
+      storeId: number | string;
+      storeName: string;
+      storeStatus?: number;
+      addressInfo?: {
+        provinceName?: string;
+        cityName?: string;
+        areaName?: string;
+        detailAddr?: string;
+      } | null;
     }>;
   }>;
 }
 
 export async function fetchShopList(): Promise<ShopBrief[]> {
-  const data = await siteFetch<QueryCityPoiResp>(
-    '/api/v1/common/poi/queryCityPoiListWithPermission?yodaReady=h5&csecplatform=4&csecversion=4.2.0',
+  const data = await siteFetch<StoreSelectorAggByCityResp>(
+    qnhApiPath('/core/poi/b/store/selector/agg-by-city'),
     {
       method: 'POST',
       headers: {
@@ -101,7 +158,7 @@ export async function fetchShopList(): Promise<ShopBrief[]> {
         'm-appkey': 'fe_recofesaascrm',
         qnhreferrer: '/unifiedGoods/store/spu-list',
       },
-      body: '{}',
+      body: JSON.stringify({ statusList: [1, 2] }),
     },
   );
   if (data?.code !== 0) {
@@ -109,11 +166,11 @@ export async function fetchShopList(): Promise<ShopBrief[]> {
   }
   const result: ShopBrief[] = [];
   for (const city of data.data ?? []) {
-    for (const poi of city.poiList ?? []) {
+    for (const store of city.storeList ?? []) {
       result.push({
-        shopId: poi.poiId,
-        shopName: poi.poiName,
-        region: city.cityName ?? poi.cityName,
+        shopId: store.storeId,
+        shopName: store.storeName,
+        region: city.cityName ?? store.addressInfo?.cityName,
       });
     }
   }
@@ -159,7 +216,7 @@ export async function fetchFrontCategoryTree(payload: {
 }): Promise<import('@shared/messaging').FrontCategoryNode[]> {
   void payload; // 接口本身按当前登录租户/选中门店上下文返回,不需要参数
   const resp = await siteFetch<FrontCategoryQueryResp>(
-    '/qnh-gw3/api/product/support/front-category/query?yodaReady=h5&csecplatform=4&csecversion=4.2.0',
+    qnhApiPath('/qnh-gw3/api/product/support/front-category/query'),
     {
       method: 'POST',
       headers: {
@@ -304,7 +361,7 @@ async function fetchProductListTenant(payload: {
   }
 
   const data = await siteFetch<PageQuerySpuResp>(
-    '/qnh-gw3/api/product/tenant/page-query?yodaReady=h5&csecplatform=4&csecversion=4.2.0',
+    qnhApiPath('/qnh-gw3/api/product/tenant/page-query'),
     {
       method: 'POST',
       headers: {
@@ -358,7 +415,7 @@ async function fetchProductListStore(payload: {
   }
 
   const data = await siteFetch<PageQuerySpuResp>(
-    '/qnh-gw3/api/product/store/page-query-spu?yodaReady=h5&csecplatform=4&csecversion=4.2.0',
+    qnhApiPath('/qnh-gw3/api/product/store/page-query-spu'),
     {
       method: 'POST',
       headers: {
@@ -609,7 +666,7 @@ export async function fetchProductDetail(payload: {
 }): Promise<ProductSpu> {
   void payload.shopId; // tenant/detail 不需要门店上下文,通过 cookie 识别租户
   const resp = await siteFetch<ProductDetailResp>(
-    '/qnh-gw3/api/product/tenant/detail?yodaReady=h5&csecplatform=4&csecversion=4.2.0',
+    qnhApiPath('/qnh-gw3/api/product/tenant/detail'),
     {
       method: 'POST',
       headers: {
@@ -973,7 +1030,7 @@ export async function createProduct(payload: {
   };
 
   const resp = await siteFetch<CreateProductResp>(
-    '/qnh-gw3/api/product/tenant/create/v2?yodaReady=h5&csecplatform=4&csecversion=4.2.0',
+    qnhApiPath('/qnh-gw3/api/product/tenant/create/v2'),
     {
       method: 'POST',
       headers: QNH_GW_HEADERS,
@@ -1063,7 +1120,7 @@ export async function updateProduct(payload: {
   };
 
   const resp = await siteFetch<UpdateProductResp>(
-    '/qnh-gw3/api/product/tenant/update/v2?yodaReady=h5&csecplatform=4&csecversion=4.2.0',
+    qnhApiPath('/qnh-gw3/api/product/tenant/update/v2'),
     {
       method: 'POST',
       headers: {
@@ -1968,7 +2025,7 @@ export async function adjustSkuPrice(payload: {
   };
 
   const resp = await siteFetch<AdjustPriceResp>(
-    '/api/v1/price/adjustSkuOnlinePriceSyncStrategy?yodaReady=h5&csecplatform=4&csecversion=4.2.0',
+    qnhApiPath('/api/v1/price/adjustSkuOnlinePriceSyncStrategy'),
     {
       method: 'POST',
       headers: {
@@ -2032,7 +2089,7 @@ export async function adjustSkuStock(payload: {
   };
 
   const resp = await siteFetch<AdjustStockResp>(
-    '/api/v1/storeempower/operate/batchContainer/stockadjustment?yodaReady=h5&csecplatform=4&csecversion=4.2.0',
+    qnhApiPath('/api/v1/storeempower/operate/batchContainer/stockadjustment'),
     {
       method: 'POST',
       headers: {
@@ -2093,7 +2150,7 @@ export async function fetchStoreSkuInfo(payload: {
   spuId: string | number;
 }): Promise<import('@shared/messaging').StoreSkuInfo[]> {
   const resp = await siteFetch<StoreDetailResp>(
-    '/qnh-gw3/api/product/store/detail?yodaReady=h5&csecplatform=4&csecversion=4.2.0',
+    qnhApiPath('/qnh-gw3/api/product/store/detail'),
     {
       method: 'POST',
       headers: {
