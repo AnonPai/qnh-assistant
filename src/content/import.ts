@@ -91,9 +91,9 @@ interface RunImportArgs {
    */
   syncImages?: boolean;
   /**
-   * 名称一致但 UPC 不一致时是否走"修改"。默认 false。
-   * - false(默认):目标店已有同名商品但 UPC 对不上 → 跳过,不新建也不修改(避免误覆盖/建重复)
-   * - true:把这种"仅同名命中"也当作已存在,走 update 路径(先比对,不一致才改)
+   * 名称一致但 UPC 不一致时是否走"修改"。默认 true。
+   * - true(默认):把这种"仅同名命中"也当作已存在,走 update 路径(先比对,不一致才改)
+   * - false:目标店已有同名商品但 UPC 对不上 → 跳过,不新建也不修改(避免误覆盖/建重复)
    * 仅在全量模式下生效;增量模式同名一律跳过。
    */
   updateOnNameMatch?: boolean;
@@ -116,7 +116,7 @@ export async function runImport({
   mode = 'full',
   confirmMode = 'auto',
   syncImages = true,
-  updateOnNameMatch = false,
+  updateOnNameMatch = true,
   frontCategoryMappingFile,
   requestConfirm,
   cancelFlag,
@@ -348,9 +348,9 @@ export async function runImport({
       }
 
       // 全量模式下,UPC 没命中但「商品名」命中:目标店已有同名商品。
-      // 默认行为(updateOnNameMatch = false):不能走 update(没有可靠的 UPC 对应关系,
+      // 取消 updateOnNameMatch 时:不能走 update(没有可靠的 UPC 对应关系,
       // 贸然改会改错商品),也不能走 create(否则会建出重复的同名商品),直接跳过并提示。
-      // 开启 updateOnNameMatch 后:把"仅同名命中"也当作已存在,继续往下走 update 路径
+      // 默认开启 updateOnNameMatch:把"仅同名命中"也当作已存在,继续往下走 update 路径
       // (后面 willUpdate 会接管,先比对、不一致才真正调 update)。
       if (matched && mode === 'full' && matched.reason === '同名' && !updateOnNameMatch) {
         log.warn(`[全量] 目标店已存在同名商品,跳过新建: ${spu.name} → 目标 SPU ${matched.spuId}`);

@@ -518,7 +518,7 @@ interface RawProductDetail {
   videoInfo?: { videoUrl?: string; coverUrl?: string; coverImageUrl?: string; clean?: unknown } | null;
   description?: string;
   sellPoint?: string;
-  /** 美团闪购渠道特殊图(配料图/营养成分图,服装含吊牌洗唛/尺码表等) */
+  /** 美团闪购渠道特殊图(配料图/营养成分图、包装标签图等) */
   mtSpecialPictureList?: Array<{ pictureType?: number; pictureUrl?: string[] | null }>;
   /** 饿了么渠道特殊图(同结构) */
   elmSpecialPictureList?: Array<{ pictureType?: number; pictureUrl?: string[] | null }>;
@@ -565,6 +565,8 @@ interface RawProductDetail {
     qualificationList?: unknown;
     channelSpuList?: unknown;
     recommendId?: unknown;
+    /** 新版 tenant/detail 会把渠道特殊图直接挂在对应渠道下 */
+    specialPictureList?: Array<{ pictureType?: number; pictureUrl?: string[] | null }>;
   }>;
   /** SKU 列表(原 storeSkuList,现在是 tenant 维度的主档 SKU) */
   skus?: RawTenantSku[];
@@ -707,18 +709,24 @@ export async function fetchProductDetail(payload: {
     .filter(Boolean)
     .map(upgradeRequired);
 
-  // 3) 美团闪购渠道特殊图:mtSpecialPictureList[].pictureUrl[]
-  //    服装类目下还包含 pictureType=7「吊牌及洗唛」/ pictureType=14「尺码表」等
-  const mtSpecialPictureUrls = uniqueStrings(
-    (d.mtSpecialPictureList ?? []).flatMap((p) => p.pictureUrl ?? []),
-  )
+  // 3) 美团闪购渠道特殊图:
+  //    - 旧版 tenant/detail 顶层 mtSpecialPictureList[].pictureUrl[]
+  //    - 新版 detail 会把礼赠包装图 / 包装标签图 / 选购指南图等放到
+  //      spuChannelInfoList[channelId=100].specialPictureList[].pictureUrl[]
+  const mtSpecialPictures = mergeSpecialPictures(
+    d.mtSpecialPictureList,
+    d.spuChannelInfoList?.find((c) => c.channelId === 100)?.specialPictureList,
+  );
+  const mtSpecialPictureUrls = uniqueStrings(mtSpecialPictures.flatMap((p) => p.pictureUrl ?? []))
     .filter(Boolean)
     .map(upgradeRequired);
 
-  // 4) 饿了么渠道特殊图:elmSpecialPictureList[].pictureUrl[]
-  const elmSpecialPictureUrls = uniqueStrings(
-    (d.elmSpecialPictureList ?? []).flatMap((p) => p.pictureUrl ?? []),
-  )
+  // 4) 饿了么渠道特殊图:兼容顶层 elmSpecialPictureList 与渠道内 specialPictureList
+  const elmSpecialPictures = mergeSpecialPictures(
+    d.elmSpecialPictureList,
+    d.spuChannelInfoList?.find((c) => c.channelId === 200)?.specialPictureList,
+  );
+  const elmSpecialPictureUrls = uniqueStrings(elmSpecialPictures.flatMap((p) => p.pictureUrl ?? []))
     .filter(Boolean)
     .map(upgradeRequired);
 
@@ -740,7 +748,7 @@ export async function fetchProductDetail(payload: {
   //   图 1: picUrlList[]                                         - 主图
   //   图 2: picContentList[]                                     - 图文详情
   //   图 3: mtSpecialPictureList[].pictureUrl[]                  - 美团闪购渠道特殊图
-  //         (配料/营养成分;服装含吊牌及洗唛 pictureType=7、尺码表 pictureType=14)
+  //         (配料/营养成分;服装含吊牌及洗唛、尺码表、礼赠包装图、包装标签图、选购指南图等)
   //   图 4: elmSpecialPictureList[].pictureUrl[]                 - 饿了么渠道特殊图
   //   视频: videoInfo.videoUrl
   // 故意不收的:
@@ -770,7 +778,14 @@ export async function fetchProductDetail(payload: {
     raw: {
       __pendingMedia: Array.from(pendingMap.values()),
       // 完整原始数据(已瘦身:剔除属性可选值枚举),留给导入端复刻
-      detail: slimDetail(d),
+      detail: slimDetail({
+        ...d,
+        // 导入端 buildTenantSpuV2 从 raw.detail.mt/elmSpecialPictureList 取渠道特殊图。
+        // 新版 tenant/detail 可能只在 spuChannelInfoList[].specialPictureList 返回包装标签图等,
+        // 这里归一到顶层,保证导入 update/create 都能下沉到渠道 specialPictureList。
+        mtSpecialPictureList: mtSpecialPictures,
+        elmSpecialPictureList: elmSpecialPictures,
+      }),
     },
   };
 }
@@ -866,6 +881,40 @@ function uniqueStrings(arr: Array<string | undefined | null>): string[] {
     out.push(s);
   }
   return out;
+}
+
+type RawSpecialPicture = NonNullable<RawProductDetail['mtSpecialPictureList']>[number];
+
+/**
+ * 兼容两种详情结构的渠道特殊图:
+ *   - 老结构:顶层 mtSpecialPictureList / elmSpecialPictureList
+ *   - 新结构:spuChannelInfoList[].specialPictureList(包装标签图等会出现在这里)
+ * 同 pictureType 两边都存在时合并图片 URL,并优先保留渠道内返回的元数据。
+ */
+function mergeSpecialPictures(
+  topList: RawProductDetail['mtSpecialPictureList'] | undefined,
+  channelList: RawProductDetail['mtSpecialPictureList'] | undefined,
+): RawSpecialPicture[] {
+  const byType = new Map<number, RawSpecialPicture>();
+  for (const item of [...(topList ?? []), ...(channelList ?? [])]) {
+    const pictureType = Number(item.pictureType ?? 0);
+    const prev = byType.get(pictureType);
+    if (!prev) {
+      byType.set(pictureType, {
+        ...item,
+        pictureType: item.pictureType,
+        pictureUrl: uniqueStrings(item.pictureUrl ?? []),
+      });
+      continue;
+    }
+    byType.set(pictureType, {
+      ...prev,
+      ...item,
+      pictureType: item.pictureType ?? prev.pictureType,
+      pictureUrl: uniqueStrings([...(prev.pictureUrl ?? []), ...(item.pictureUrl ?? [])]),
+    });
+  }
+  return Array.from(byType.values());
 }
 
 function addPending(map: Map<string, PendingMedia>, url: string, kind: 'image' | 'video', ref: string) {
@@ -1273,10 +1322,22 @@ function buildTenantSpuV2(
   });
 
   // 渠道侧特殊图(预先备好,update 下沉到渠道里;create 也下沉到渠道里)
-  // 源端 detail 里 media:// 已被上一步替换成 fileUrl,直接用
+  // 源端 detail 里 media:// 已被上一步替换成 fileUrl,直接用。
+  // 兼容历史导出包:部分 tenant/detail 会把包装标签图等只放在
+  // spuChannelInfoList[].specialPictureList,而不是顶层 mt/elmSpecialPictureList。
   const specialSource = detail;
-  const mtSpecial = trimSpecialPictures(specialSource.mtSpecialPictureList);
-  const elmSpecial = trimSpecialPictures(specialSource.elmSpecialPictureList);
+  const mtSpecial = trimSpecialPictures(
+    mergeSpecialPictures(
+      specialSource.mtSpecialPictureList,
+      specialSource.spuChannelInfoList?.find((c) => c.channelId === 100)?.specialPictureList,
+    ),
+  );
+  const elmSpecial = trimSpecialPictures(
+    mergeSpecialPictures(
+      specialSource.elmSpecialPictureList,
+      specialSource.spuChannelInfoList?.find((c) => c.channelId === 200)?.specialPictureList,
+    ),
+  );
 
   // 渠道列表(create / update 形态差异较大)
   // 多规格(specType=2)需要把 SKU 上的销售属性聚合到渠道级 saleAttrList,否则

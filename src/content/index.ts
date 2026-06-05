@@ -160,7 +160,7 @@ export function startImport(args: {
   confirmMode?: import('@shared/messaging').ImportConfirmMode;
   /** 是否同步图片(默认 true);false 时跳过上传与图片比对 */
   syncImages?: boolean;
-  /** 名称一致但 UPC 不一致时是否走修改(默认 false) */
+  /** 名称一致但 UPC 不一致时是否走修改(默认 true) */
   updateOnNameMatch?: boolean;
   /** 可选:用户人工维护的「店内分类映射」文件 */
   frontCategoryMappingFile?: File | null;
@@ -174,7 +174,7 @@ export function startImport(args: {
     mode: args.mode ?? 'full',
     confirmMode: args.confirmMode ?? 'auto',
     syncImages: args.syncImages ?? true,
-    updateOnNameMatch: args.updateOnNameMatch ?? false,
+    updateOnNameMatch: args.updateOnNameMatch ?? true,
     frontCategoryMappingFile: args.frontCategoryMappingFile,
     requestConfirm: args.requestConfirm,
     cancelFlag,

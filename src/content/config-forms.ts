@@ -822,7 +822,7 @@ export interface ImportFormResult {
   confirmMode: 'auto' | 'manual';
   /** 是否同步图片;false 时跳过所有图片上传 / 比对 */
   syncImages: boolean;
-  /** 名称一致但 UPC 不一致时是否走修改(默认 false) */
+  /** 名称一致但 UPC 不一致时是否走修改(默认 true) */
   updateOnNameMatch: boolean;
   /** 用户附带的店内分类映射文件(可选) */
   frontCategoryMappingFile: File | null;
@@ -901,9 +901,9 @@ export function openImportForm(_args: OpenImportFormArgs = {}): Promise<ImportFo
             <div class="qnh-fm-section">
               <span class="qnh-fm-section__label">同名异 UPC 处理</span>
               <label class="qnh-fm-check">
-                <input type="checkbox" data-id="update-on-name" />
+                <input type="checkbox" data-id="update-on-name" checked />
                 <span>名称一致但 UPC 不一致时也更新</span>
-                <span class="qnh-fm-check__hint">默认不勾选:这种商品直接跳过(不新建也不修改)。勾选后会走"修改"接口,有覆盖到同名不同商品的风险。仅全量模式生效。</span>
+                <span class="qnh-fm-check__hint">默认勾选:这种商品会走"修改"接口。取消勾选后直接跳过(不新建也不修改)。有覆盖到同名不同商品的风险。仅全量模式生效。</span>
               </label>
             </div>
 
