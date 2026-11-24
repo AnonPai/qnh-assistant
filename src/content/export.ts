@@ -32,7 +32,7 @@ import {
   MANIFEST_FILE,
   getOrCreateDir,
   readExportProgress,
-  readJsonFile,
+  readManifestIfComplete,
   removeExportProgress,
   writeBinaryFile,
   writeExportProgress,
@@ -85,6 +85,19 @@ interface ProductListPage {
 /** 商品列表 / 队列里每一项的形态(和 ExportProgressFile.queue 等价) */
 type QueueItem = ExportProgressFile['queue'][number];
 
+type ExportFilters = Pick<RunExportArgs, 'limitCount' | 'spuIdAllowlist' | 'spuNameKeyword' | 'skuUpcList' | 'skuIdList'>;
+
+/** 同一组 ID 换序仍可续传。显式 SPU 清单优先于列表筛选。 */
+export function exportFilterKey(filters: ExportFilters): string {
+  const sorted = (ids?: Array<string | number>) => [...new Set((ids ?? []).map(String))].sort();
+  if (filters.spuIdAllowlist?.length) return JSON.stringify({ spu: sorted(filters.spuIdAllowlist) });
+  const name = filters.spuNameKeyword?.trim() ?? '';
+  const upcs = sorted(filters.skuUpcList);
+  const skus = sorted(filters.skuIdList);
+  const limit = Math.max(0, filters.limitCount ?? 0);
+  return name || upcs.length || skus.length || limit ? JSON.stringify({ name, upcs, skus, limit }) : '';
+}
+
 export async function runExport({
   sourceShopId,
   sourceShopName,
@@ -108,6 +121,7 @@ export async function runExport({
   // SKU id 筛选:同样规整成去重后的非空集合
   const skuIdFilter = normalizeUpcFilter(skuIdList?.map(String));
   const useSkuIdFilter = skuIdFilter.size > 0;
+  const filterKey = exportFilterKey({ limitCount, spuNameKeyword, spuIdAllowlist, skuUpcList, skuIdList });
 
   // ---- 0) 准备目录与续传状态 ----
   const productsDir = await getOrCreateDir(targetDir, 'products');
@@ -118,6 +132,7 @@ export async function runExport({
     existingProgress &&
     String(existingProgress.source.shopId) === String(sourceShopId) &&
     existingProgress.options.includeVideo === includeVideo &&
+    (existingProgress.options.filterKey ?? '') === filterKey &&
     (existingProgress.options.includeImages ?? true) === includeImages
       ? existingProgress
       : null;
@@ -143,6 +158,10 @@ export async function runExport({
   const fetched = new Set<string>(resume?.doneSpuIds ?? []);
   const queue: QueueItem[] = resume ? [...resume.queue] : [];
   let listFinished = resume?.listFinished ?? false;
+  const saveProgress = () => persistProgress({
+    targetDir, sourceShopId, sourceShopName, includeVideo, includeImages, filterKey,
+    fetched, queue, listFinished, existingCreatedAt: resume?.createdAt,
+  });
 
   if (!listFinished) {
     if (useAllowlist) {
@@ -164,22 +183,13 @@ export async function runExport({
       );
       listFinished = true;
       log.info(`使用 SPU 清单导出,共 ${spuIdAllowlist!.length} 个`);
-      await persistProgress({
-        targetDir,
-        sourceShopId,
-        sourceShopName,
-        includeVideo,
-        includeImages,
-        fetched,
-        queue,
-        listFinished,
-        existingCreatedAt: resume?.createdAt,
-      });
+      await saveProgress();
     } else {
       onProgress({ kind: 'export', phase: 'list', current: 0, total: 0, message: '加载商品列表' });
       let pageNo = 1;
-      const pageSize = limited ? 10 : 50;
-      const allList: Array<{ spuId: string | number; name: string; upcList?: string[]; skuIdList?: string[] }> = [];
+      const pageSize = limited ? Math.min(limitCount!, 50) : 50;
+      let scanned = 0;
+      const targetList: Array<{ spuId: string | number; name: string; upcList?: string[]; skuIdList?: string[] }> = [];
       while (!cancelFlag.cancelled) {
         const page = await callInjected<ProductListPage>({
           type: 'FETCH_PRODUCT_LIST',
@@ -193,61 +203,31 @@ export async function runExport({
             scope: 'store',
           },
         });
-        allList.push(...page.list);
-        onProgress({ kind: 'export', phase: 'list', current: allList.length, total: page.total });
-        if (limited) break;
-        if (allList.length >= page.total || page.list.length === 0) break;
+        scanned += page.list.length;
+        for (const item of page.list) {
+          if (useUpcFilter && !(item.upcList ?? []).some(upc => upcFilter.has(normalizeUpc(upc)))) continue;
+          if (useSkuIdFilter && !(item.skuIdList ?? []).some(id => skuIdFilter.has(normalizeUpc(id)))) continue;
+          targetList.push(item);
+          if (limited && targetList.length >= limitCount!) break;
+        }
+        onProgress({ kind: 'export', phase: 'list', current: scanned, total: page.total });
+        if (limited && targetList.length >= limitCount!) break;
+        if (page.list.length === 0 || (page.total > 0 && scanned >= page.total)) break;
         pageNo++;
         await jitter(...THROTTLE.EXPORT_LIST_PAGE);
       }
       if (cancelFlag.cancelled) {
-        // 把已抓的列表先落盘,下次直接从这里接
-        await persistProgress({
-          targetDir,
-          sourceShopId,
-          sourceShopName,
-          includeVideo,
-          includeImages,
-          fetched,
-          queue,
-          listFinished: false,
-          existingCreatedAt: resume?.createdAt,
-        });
+        // 列表尚未完整，续传时重新分页。
+        await saveProgress();
         throw new Error('已取消');
       }
-      const limitedList = limited ? allList.slice(0, limitCount!) : allList;
-      // 本地兜底过滤:后端如果忽略了 upcList / skuIdList 透传,这里按门店列表里
-      // 每个 SPU 的 upcList / skuIdList 精确比对。两个筛选都给时取交集(都要命中)。
-      const targetList = limitedList.filter((it) => {
-        if (useUpcFilter && !(it.upcList ?? []).some((u) => upcFilter.has(normalizeUpc(u)))) {
-          return false;
-        }
-        if (useSkuIdFilter && !(it.skuIdList ?? []).some((s) => skuIdFilter.has(normalizeUpc(s)))) {
-          return false;
-        }
-        return true;
-      });
-      log.info(
-        `商品总数: ${allList.length}` +
-          (limited ? `,本次仅导出前 ${limitedList.length} 个` : '') +
-          (useUpcFilter || useSkuIdFilter ? `,按 SKU/条码筛选后 ${targetList.length} 个` : ''),
-      );
+      log.info(`已扫描 ${scanned} 个商品，本次选中 ${targetList.length} 个`);
       queue.push(
         ...targetList.map((it) => ({ spuId: it.spuId, name: it.name, reason: 'list' as const })),
       );
       listFinished = true;
 
-      await persistProgress({
-        targetDir,
-        sourceShopId,
-        sourceShopName,
-        includeVideo,
-        includeImages,
-        fetched,
-        queue,
-        listFinished,
-        existingCreatedAt: resume?.createdAt,
-      });
+      await saveProgress();
     }
   } else {
     log.info(`续传:已写入 ${fetched.size} 个 SPU,队列里还有 ${queue.length} 个待处理`);
@@ -263,17 +243,7 @@ export async function runExport({
 
   while (queue.length > 0) {
     if (cancelFlag.cancelled) {
-      await persistProgress({
-        targetDir,
-        sourceShopId,
-        sourceShopName,
-        includeVideo,
-        includeImages,
-        fetched,
-        queue,
-        listFinished,
-        existingCreatedAt: resume?.createdAt,
-      });
+      await saveProgress();
       throw new Error('已取消');
     }
     const item = queue[0];
@@ -339,17 +309,7 @@ export async function runExport({
       // 把刚刚抓下来的媒体已经落了盘,但 SPU 自己还没写;不计入 fetched
       // 下次续传会重新跑这个 SPU,媒体因为 hash 命中能跳过实际下载
       processed--;
-      await persistProgress({
-        targetDir,
-        sourceShopId,
-        sourceShopName,
-        includeVideo,
-        includeImages,
-        fetched,
-        queue,
-        listFinished,
-        existingCreatedAt: resume?.createdAt,
-      });
+      await saveProgress();
       throw new Error('已取消');
     }
 
@@ -364,21 +324,11 @@ export async function runExport({
     }
 
     // 商品 json 落盘 — 这是 SPU 的"提交点"。落盘后才把它登记到 fetched + 进度文件
-    await writeJsonFile(productsDir, `${spu.sourceSpuId}.json`, spu);
+    await writeJsonFile(productsDir, `${key}.json`, spu);
 
     fetched.add(key);
     queue.shift();
-    await persistProgress({
-      targetDir,
-      sourceShopId,
-      sourceShopName,
-      includeVideo,
-      includeImages,
-      fetched,
-      queue,
-      listFinished,
-      existingCreatedAt: resume?.createdAt,
-    });
+    await saveProgress();
 
     onProgress({
       kind: 'log',
@@ -392,10 +342,11 @@ export async function runExport({
   }
 
   // ---- 5) manifest + media 索引 ----
+  if (cancelFlag.cancelled) throw new Error('已取消');
   const allMediaAssets = await collectMediaAssetsForManifest(mediaDir, mediaIndex);
   const manifest: ExportManifest = {
     schemaVersion: 1,
-    pluginVersion: '0.1.0',
+    pluginVersion: chrome.runtime.getManifest().version,
     source: {
       shopId: shop.shopId,
       shopName: shop.shopName,
@@ -403,6 +354,7 @@ export async function runExport({
       exportedAt: new Date().toISOString(),
     },
     productCount: fetched.size,
+    productIds: [...fetched],
     mediaCount: allMediaAssets.length,
   };
   await writeJsonFile(targetDir, 'media.json', allMediaAssets);
@@ -410,7 +362,7 @@ export async function runExport({
   // 完成后清掉续传文件,留 manifest 作为完整标记
   await removeExportProgress(targetDir);
 
-  onProgress({ kind: 'done', result: { manifest, fileName: '(目录直写)' } });
+  onProgress({ kind: 'done', result: { manifest, fileName: targetDir.name } });
 }
 
 /** 把进度文件原子写盘,所有可能"中断"的位置都过这一个出口 */
@@ -420,6 +372,7 @@ async function persistProgress(args: {
   sourceShopName?: string;
   includeVideo: boolean;
   includeImages: boolean;
+  filterKey: string;
   fetched: Set<string>;
   queue: QueueItem[];
   listFinished: boolean;
@@ -429,7 +382,7 @@ async function persistProgress(args: {
     schemaVersion: 1,
     createdAt: args.existingCreatedAt ?? new Date().toISOString(),
     source: { shopId: args.sourceShopId, shopName: args.sourceShopName },
-    options: { includeVideo: args.includeVideo, includeImages: args.includeImages },
+    options: { includeVideo: args.includeVideo, includeImages: args.includeImages, filterKey: args.filterKey },
     doneSpuIds: [...args.fetched],
     doneMediaHashes: [], // 媒体跳过下载靠"目录里 hash 文件已存在"的现场判断,这里不维护
     queue: args.queue,
@@ -610,6 +563,7 @@ async function enrichWithStoreSkuInfo(
     if (!info && sku.outerSkuCode) info = byUpc.get(String(sku.outerSkuCode).trim());
     if (!info) continue;
     if (info.stock != null) sku.stock = info.stock;
+    if (info.storePrice != null) sku.storePrice = info.storePrice;
     if (info.channelPrices.length > 0) sku.channelPrices = info.channelPrices;
   }
 }
@@ -648,7 +602,7 @@ export type ExportTargetStatus =
 export async function detectExportTargetStatus(
   dir: FileSystemDirectoryHandle,
 ): Promise<ExportTargetStatus> {
-  const manifest = await readJsonFile<ExportManifest>(dir, MANIFEST_FILE);
+  const manifest = await readManifestIfComplete(dir);
   if (manifest) return { kind: 'complete', manifest };
   const progress = await readExportProgress(dir);
   if (progress) return { kind: 'incomplete', progress };

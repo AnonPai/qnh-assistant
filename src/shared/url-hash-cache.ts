@@ -9,14 +9,14 @@
  *
  * 落盘文件名:`.qnh-target-image-hashes.json`,放在源目录(用户挑的导入目录),
  * 跟 manifest / progress 同级。结构:
- *   { schemaVersion: 1, entries: { [url]: hash } }
+ *   { schemaVersion: 2, entries: { [url]: hash } }
  */
 
 import { sha256Hex, base64ToBytes } from './hash';
 
 interface CacheFile {
-  schemaVersion: 1;
-  /** url(已 normalize:scheme 升 https,去掉 query/hash)→ sha256 hex */
+  schemaVersion: 1 | 2;
+  /** URL（保留可能影响图片内容的查询参数）→ SHA-256 */
   entries: Record<string, string>;
   /**
    * 「源图内容 hash」→「上传到目标店后、美团重新编码存储的内容 hash」等价表。
@@ -31,15 +31,14 @@ const CACHE_FILE = '.qnh-target-image-hashes.json';
 /**
  * URL 归一(只做最低限度的清理,避免把"同一张图的不同访问形式"算成两条记录):
  *   - http → https(background fetch 也是这么升的)
- *   - 去掉 query / hash 片段(美团 CDN 的图片处理参数不影响字节内容)
+ *   - 只去掉不会发送给服务器的 fragment，保留缩放、裁剪等查询参数
  *   - 不动路径前缀 (sgfn / retailsp / 0.0.o / @缩放参数 等),
  *     因为这些前缀对应的资源字节有可能不同,各自独立 hash 才安全
  */
 function canonicalizeUrl(url: string): string {
   if (!url) return '';
   const upgraded = url.replace(/^http:\/\//i, 'https://');
-  const noQuery = upgraded.split('?')[0].split('#')[0];
-  return noQuery;
+  return upgraded.split('#')[0];
 }
 
 export class UrlHashCache {
@@ -60,7 +59,8 @@ export class UrlHashCache {
   static async load(dir: FileSystemDirectoryHandle | null | undefined): Promise<UrlHashCache> {
     if (!dir) return new UrlHashCache({});
     const data = await tryReadCache(dir);
-    return new UrlHashCache(data?.entries ?? {}, data?.uploadEquiv);
+    // 旧版丢弃了查询参数，不能据此判断两种裁剪版本是同一张图。
+    return new UrlHashCache(data?.schemaVersion === 2 ? data.entries : {}, data?.uploadEquiv);
   }
 
   /**
@@ -125,7 +125,7 @@ export class UrlHashCache {
   async flush(dir: FileSystemDirectoryHandle | null | undefined): Promise<void> {
     if (!dir || !this.dirty) return;
     const out: CacheFile = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       entries: Object.fromEntries(this.map),
       uploadEquiv: Object.fromEntries(this.uploadEquiv),
     };
@@ -144,7 +144,7 @@ async function tryReadCache(dir: FileSystemDirectoryHandle): Promise<CacheFile |
     const file = await fh.getFile();
     const text = await file.text();
     const data = JSON.parse(text) as CacheFile;
-    if (data?.schemaVersion !== 1 || !data.entries || typeof data.entries !== 'object') return null;
+    if ((data?.schemaVersion !== 1 && data?.schemaVersion !== 2) || !data.entries || typeof data.entries !== 'object') return null;
     return data;
   } catch {
     return null;

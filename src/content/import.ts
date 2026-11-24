@@ -15,6 +15,7 @@
 import { createLogger } from '@shared/logger';
 import { bytesToBase64 } from '@shared/hash';
 import { normalizeLegacyDetail } from '@shared/normalize-legacy-detail';
+import { jdStoreSpecs, type StoreSpecDetail } from '@shared/store-specs';
 import { jitter, THROTTLE } from '@shared/sleep';
 import { UrlHashCache, fetchUrlAsArrayBuffer } from '@shared/url-hash-cache';
 import type {
@@ -31,15 +32,17 @@ import type {
   ImportMode,
   ProgressEvent,
   UploadedMedia,
+  StoreImportOptions,
 } from '@shared/messaging';
 import type { CallInjected } from './index';
+import { rememberStoreImage, reuseStoreImages } from './store-images';
 import {
   findFileByPrefix,
   getSubdirOrNull,
-  listFileNames,
+  readExportedProducts,
+  readManifestIfComplete,
   readFileBlob,
   readJsonFile,
-  readTextFile,
   writeTextFile,
 } from './fs-stage';
 
@@ -67,6 +70,7 @@ export type ConfirmDecision = 'confirm' | 'skip' | 'cancel-all';
 
 /** 调用方提供的确认函数:在 UI 层弹一个确认框,返回用户选择 */
 export type RequestConfirm = (info: {
+  signal?: AbortSignal;
   productName: string;
   productCurrent: number;
   productTotal: number;
@@ -75,6 +79,7 @@ export type RequestConfirm = (info: {
 }) => Promise<ConfirmDecision>;
 
 interface RunImportArgs {
+  store?: StoreImportOptions;
   /** 用户选定的导入源目录(由 inpage UI 通过 showDirectoryPicker 拿到) */
   sourceDir: FileSystemDirectoryHandle;
   mapping: CategoryMapping;
@@ -105,12 +110,13 @@ interface RunImportArgs {
   frontCategoryMappingFile?: File | null;
   /** 手动模式必须提供;UI 层弹确认框,返回用户决定 */
   requestConfirm?: RequestConfirm;
-  cancelFlag: { cancelled: boolean };
+  cancelFlag: { cancelled: boolean; controller?: AbortController };
   onProgress: (e: ProgressEvent) => void;
   callInjected: CallInjected;
 }
 
 export async function runImport({
+  store,
   sourceDir,
   mapping,
   mode = 'full',
@@ -166,14 +172,16 @@ export async function runImport({
   // ---- 探针店:仍有少数接口(创建商品、上传图片、查询商品列表/详情、店内分类树)
   // 必须带一个 storeId 上下文。导入面向"租户主档",但这些接口的语义是"以某门店身份调用",
   // 因此自动取当前账号下第一家门店做探针店即可。用户层面已经不需要选门店了。
-  const probeShopId = await resolveProbeShopId(callInjected);
-  log.info(`探针店:${probeShopId}(无需用户选择,默认取首家)`);
-  recordLog('info', `探针店=${probeShopId}`);
+  if (store && (!Number.isSafeInteger(Number(store.shopId)) || Number(store.shopId) <= 0)) {
+    throw new Error('请选择有效的目标门店');
+  }
+  const probeShopId = store ? store.shopId : await resolveProbeShopId(callInjected);
+  recordLog('info', `${store ? '目标门店' : '主档探针店'}=${probeShopId}`);
 
   // ---- 1) 解析源目录 ----
   onProgress({ kind: 'import', phase: 'parse', current: 0, total: 1, message: '读取数据目录' });
 
-  const manifest = await readJsonFile<ExportManifest>(sourceDir, 'manifest.json');
+  const manifest = await readManifestIfComplete(sourceDir);
   if (!manifest) {
     throw new Error('manifest.json 缺失,目录可能不是完整的导出包(或导出未完成)');
   }
@@ -185,25 +193,9 @@ export async function runImport({
     throw new Error('products 子目录缺失,目录不是有效的导出包');
   }
 
-  const products: ProductSpu[] = [];
-  const productFileNames = await listFileNames(productsDir);
-  // 先读全量,几千个 JSON 文件大约几十 MB 内存,完全可以一次性加载;
-  // 比起 zip 路径 base64 + 解压双份内存,这条路反而轻量。
-  for (const name of productFileNames) {
-    if (!name.endsWith('.json')) continue;
-    const text = await readTextFile(productsDir, name);
-    if (!text) continue;
-    try {
-      const spu = JSON.parse(text) as ProductSpu;
-      // 兼容历史导出包(早期 store/detail 形态)→ 归一成 tenant/detail 形态,
-      // 后续创建 / 修改 / 比对统一按一种形态处理
-      if (spu.raw?.detail) {
-        (spu.raw as Record<string, unknown>).detail = normalizeLegacyDetail(spu.raw.detail);
-      }
-      products.push(spu);
-    } catch (e) {
-      log.warn(`解析商品文件失败,跳过: ${name}`, e);
-    }
+  const products = await readExportedProducts(productsDir, manifest);
+  for (const spu of products) {
+    if (spu.raw?.detail) spu.raw.detail = normalizeLegacyDetail(spu.raw.detail);
   }
 
   // hash → 原始 CDN URL 索引(从导出包的 media.json 来),
@@ -303,6 +295,7 @@ export async function runImport({
      * 避免出现"子单品报错 → 父组合装也跟着崩"的连锁失败。
      */
     let matchedForFallback: { spuId: string | number; reason: string } | null = null;
+    let createdStoreSpuId: string | number | undefined;
     try {
       // (a) 按当前商品的 UPC 去目标店做一次精准存在性查询
       //   - 之前是预拉全店建索引(几千条 UPC + 名字),小批量导入时浪费严重
@@ -311,10 +304,11 @@ export async function runImport({
         callInjected,
         probeShopId,
         spu,
+        store ? 'store' : 'tenant',
       );
       matchedForFallback = matched;
 
-      if (matched && mode === 'incremental') {
+      if (matched && (store || mode === 'incremental')) {
         // 增量: 命中即跳过,只把映射写进去给组合装用
         log.info(`[增量] 跳过已存在: ${spu.name} → 目标 SPU ${matched.spuId}`);
         try {
@@ -345,6 +339,17 @@ export async function runImport({
         });
         emitLog('info', `跳过 ${spu.name} · 已存在(${matched.reason})`);
         continue;
+      }
+
+      if (store) {
+        const master = await lookupExistingForProduct(callInjected, probeShopId, spu, 'tenant');
+        if (master) {
+          const reason = `主档已有匹配商品（${master.spuId}，${master.reason}），请在后台关联到此门店`;
+          items.push({ sourceSpuId: spu.sourceSpuId, name: spu.name, status: 'skipped', errorMessage: reason });
+          emitLog('warn', `跳过 ${spu.name} · ${reason}`);
+          continue;
+        }
+        jdStoreSpecs(spu.raw?.detail as StoreSpecDetail | undefined);
       }
 
       // 全量模式下,UPC 没命中但「商品名」命中:目标店已有同名商品。
@@ -402,15 +407,13 @@ export async function runImport({
       //   - UPC 命中:一定走 update
       //   - 仅同名命中:只有开启 updateOnNameMatch 时才走 update(否则上面已 continue 跳过)
       // update body 里 picUrlList / picContentList / videoInfo / specialPictureList 都要写,
-      // 与 create 一样会覆盖目标店现有图片字段。要让"源端图改了就改、没改就不动"
-      // 这个语义成立,必须先上传源端图、再让 buildTenantSpuV2(update) 用源端 detail
-      // 派生 picUrlList,跟 create 路径保持一致。
+      // 按源端的顺序生成图片列表，相同内容可直接填写目标商品现有的地址。
       const willUpdate =
         !!matched &&
         mode === 'full' &&
         (matched.reason.startsWith('UPC=') ||
           (matched.reason === '同名' && updateOnNameMatch));
-      let targetDetailForUpdate: unknown;
+      let targetDetailForUpdate: TargetImageDetail | undefined;
       if (willUpdate && matched) {
         targetDetailForUpdate = await fetchTargetDetailForUpdate(
           callInjected,
@@ -436,6 +439,10 @@ export async function runImport({
           )
         ) {
           log.info(`[全量·跳过] ${spu.name}: 与目标商品参数一致(库存除外),无需修改`);
+          if (syncImages) {
+            await reuseTargetImages(targetDetailForUpdate, collectMediaHashes([spu]), mediaIdMap,
+              urlHashCache, cancelFlag, probeShopId);
+          }
           // childSkuMap 仍要写,组合装父商品引用得到目标 sku
           try {
             const skuMap = await buildSkuMapping(
@@ -468,7 +475,7 @@ export async function runImport({
         }
       }
 
-      // (c) 上传图片 — create / update 都要,update body 也包含 picUrlList 等图片字段。
+      // (c) 解析图片引用，优先复用，上传剩余图片。
       // syncImages = false:跳过实际上传,直接把 mediaIdMap 填上"源端原始 CDN URL",
       // createProduct/updateProduct 仍能把 media://hash 替换成可用的 URL,
       // 后端会自行从该 URL 抓一份(等价于"图片直链同步")。
@@ -480,6 +487,7 @@ export async function runImport({
           mediaIdMap,
           skippedVideoHashes,
           urlHashCache,
+          targetDetail: targetDetailForUpdate,
           onProgress,
           cancelFlag,
           callInjected,
@@ -496,8 +504,10 @@ export async function runImport({
       }
 
       // (c.5) 手动模式 — 写入前等用户点确认
+      if (cancelFlag.cancelled) break;
       if (confirmMode === 'manual' && requestConfirm) {
         const decision = await requestConfirm({
+          signal: cancelFlag.controller?.signal,
           productName: spu.name,
           productCurrent: i + 1,
           productTotal: orderedProducts.length,
@@ -522,6 +532,7 @@ export async function runImport({
       }
 
       // (d) 创建 / 修改商品
+      if (cancelFlag.cancelled) break;
       let targetSpuId: string | number;
       let resultStatus: ImportResultItem['status'];
       if (willUpdate && matched) {
@@ -540,9 +551,17 @@ export async function runImport({
         });
         resultStatus = 'updated';
       } else {
+        const purchasePrice = store?.purchaseUnitPrice;
+        const specs = ((spu.raw?.detail as { skus?: Array<{ specName?: string; saleUnit?: string }> } | undefined)?.skus ?? [])
+          .map(s => ({ spec: s.specName ?? '', saleUnit: s.saleUnit ?? '' }));
+        if (purchasePrice != null && (!Number.isFinite(purchasePrice) || purchasePrice <= 0 ||
+            !specs.length || specs.some(s => !s.spec || !s.saleUnit) || new Set(specs.map(s => s.spec)).size !== specs.length)) {
+          throw new Error('采购配置需要有效单价、各 SKU 的销售单位及唯一规格名');
+        }
         targetSpuId = await callInjected<string | number>({
           type: 'CREATE_PRODUCT',
           payload: {
+            scope: store ? 'store' : undefined,
             shopId: probeShopId,
             product: spu,
             mediaIdMap,
@@ -551,6 +570,16 @@ export async function runImport({
             frontCategoryIdRemap,
           },
         });
+        if (store) {
+          createdStoreSpuId = targetSpuId;
+          matchedForFallback = { spuId: targetSpuId, reason: '门店已新建' };
+        }
+        if (store) {
+          if (cancelFlag.cancelled) throw new Error('任务已取消，采购配置尚未提交');
+          await callInjected({ type: 'SET_NEW_STORE_PURCHASE', payload: {
+            shopId: probeShopId, targetSpuId, unitPrice: purchasePrice, specs,
+          } });
+        }
         resultStatus = 'success';
       }
 
@@ -575,7 +604,9 @@ export async function runImport({
         `${resultStatus === 'updated' ? '修改' : '新建'} ${spu.name} · 目标 SPU ${targetSpuId}`,
       );
     } catch (e) {
-      const msg = (e as Error).message;
+      if (cancelFlag.cancelled && (e as Error).name === 'AbortError') break;
+      const msg = createdStoreSpuId == null ? (e as Error).message :
+        `门店商品已新建（${createdStoreSpuId}），请在门店核对采购配置：${(e as Error).message}`;
       log.error(`商品处理失败: ${spu.name} (sourceSpuId=${spu.sourceSpuId})`, e);
       // 失败兜底:虽然这个商品本身没建/改成功,但如果它在目标店已经存在(UPC 命中),
       // 还是把目标 SPU 记到 childSkuMap,让依赖它的组合装继续跑。
@@ -604,6 +635,7 @@ export async function runImport({
         sourceSpuId: spu.sourceSpuId,
         name: spu.name,
         status: 'failed',
+        targetSpuId: createdStoreSpuId,
         errorMessage: msg,
         durationMs: Date.now() - startTs,
       });
@@ -645,6 +677,7 @@ export async function runImport({
   }
 
   const summary: ImportSummary = {
+    cancelled: cancelFlag.cancelled,
     total: orderedProducts.length,
     succeeded: items.filter((x) => x.status === 'success').length,
     updated: items.filter((x) => x.status === 'updated').length,
@@ -1059,8 +1092,50 @@ function renderFrontCategoryMappingTemplate(args: {
 }
 
 
+type TargetImageDetail = Record<string, unknown> & {
+  picUrlList?: string[];
+  picContentList?: string[];
+  mtSpecialPictureList?: Array<{ pictureUrl?: string[] }>;
+  elmSpecialPictureList?: Array<{ pictureUrl?: string[] }>;
+  originPicUrlMapping?: Record<string, string>;
+  originPicContentMapping?: Record<string, string>;
+};
+
+/** 只复用当前目标商品实际引用的图片地址，支持换序及平台重编码后的内容比对。 */
+async function reuseTargetImages(
+  detail: TargetImageDetail,
+  pending: Set<string>,
+  mediaIdMap: Record<string, UploadedMedia>,
+  cache: UrlHashCache,
+  cancelFlag: { cancelled: boolean },
+  shopId: string | number,
+) {
+  const special = [...(detail.mtSpecialPictureList ?? []), ...(detail.elmSpecialPictureList ?? [])];
+  const originals = { ...detail.originPicUrlMapping, ...detail.originPicContentMapping };
+  const urls = new Set<string>();
+  for (const url of [...(detail.picUrlList ?? []), ...(detail.picContentList ?? []),
+    ...special.flatMap(group => group.pictureUrl ?? [])]) {
+    if (url) urls.add(url);
+    if (originals[url]) urls.add(originals[url]);
+  }
+  for (const url of urls) {
+    if (!pending.size || cancelFlag.cancelled) break;
+    try {
+      const targetHash = await cache.getOrCompute(url, fetchUrlAsArrayBuffer);
+      for (const hash of pending) {
+        if (!cache.hashesEquivalent(hash, targetHash)) continue;
+        mediaIdMap[hash] = { fileUrl: url, originFileUrl: originals[url] ?? url };
+        await rememberStoreImage(shopId, hash, mediaIdMap[hash], targetHash);
+        pending.delete(hash);
+      }
+    } catch (err) {
+      log.warn('目标图片无法核对，继续检查其他图片', url, err);
+    }
+  }
+}
+
 /**
- * 仅上传当前商品引用到的图片(视频跳过,留给后续清单导出):
+ * 仅上传当前商品尚未复用的图片(视频跳过,留给后续清单导出):
  *   - mediaIdMap 跨商品共享,同一 hash 只上传一次。
  *   - 出错抛异常,由调用方落到 items 里标记为 failed,后续商品继续。
  */
@@ -1071,10 +1146,11 @@ async function uploadMediaForProduct(args: {
   mediaIdMap: Record<string, UploadedMedia>;
   skippedVideoHashes: Set<string>;
   /**
-   * 可选:URL→hash 缓存。上传成功后顺手把"源图 hash ≡ 目标店重编码后 hash"登记进去,
+   * URL→hash 缓存。上传成功后把"源图 hash ≡ 目标店重编码后 hash"登记进去,
    * 让后续(及下次)的"修改前对比"不再因美团服务端重编码而永远误判"已修改"。
    */
-  urlHashCache?: UrlHashCache;
+  urlHashCache: UrlHashCache;
+  targetDetail?: TargetImageDetail;
   onProgress: (e: ProgressEvent) => void;
   cancelFlag: { cancelled: boolean };
   callInjected: CallInjected;
@@ -1088,6 +1164,7 @@ async function uploadMediaForProduct(args: {
     mediaIdMap,
     skippedVideoHashes,
     urlHashCache,
+    targetDetail,
     onProgress,
     cancelFlag,
     callInjected,
@@ -1096,33 +1173,21 @@ async function uploadMediaForProduct(args: {
   } = args;
 
   // 找出 spu 内所有 media://hash 引用,但去掉已经在 mediaIdMap 里的(跨商品复用)
-  const hashes = new Set<string>();
-  const re = /media:\/\/([a-f0-9]{64})/g;
-  const visit = (node: unknown) => {
-    if (typeof node === 'string') {
-      let m: RegExpExecArray | null;
-      re.lastIndex = 0;
-      while ((m = re.exec(node))) hashes.add(m[1]);
-    } else if (Array.isArray(node)) node.forEach(visit);
-    else if (node && typeof node === 'object') Object.values(node as object).forEach(visit);
-  };
-  visit(spu);
-
-  const pending: string[] = [];
-  for (const h of hashes) {
-    if (mediaIdMap[h]) continue; // 之前的商品已经传过(或视频已跳过),复用即可
-    pending.push(h);
+  const hashes = collectMediaHashes([spu]);
+  for (const hash of hashes) if (mediaIdMap[hash]) hashes.delete(hash);
+  if (targetDetail && hashes.size) {
+    await reuseTargetImages(targetDetail, hashes, mediaIdMap, urlHashCache, cancelFlag, targetShopId);
   }
+  await reuseStoreImages(targetShopId, hashes, mediaIdMap, urlHashCache, cancelFlag);
+  const pending = [...hashes];
   if (pending.length === 0) return;
 
   if (!mediaDir) {
-    log.warn(`没有 media 子目录,该商品的 ${pending.length} 个媒体引用无文件可读`);
-    for (const h of pending) mediaIdMap[h] = { fileUrl: '' };
-    return;
+    throw new Error(`缺少 media 子目录，有 ${pending.length} 个媒体文件尚未匹配，无法写入此商品。`);
   }
 
   for (let j = 0; j < pending.length; j++) {
-    if (cancelFlag.cancelled) throw new Error('已取消');
+    if (cancelFlag.cancelled) throw new DOMException('已取消', 'AbortError');
     const hash = pending[j];
     onProgress({
       kind: 'import',
@@ -1154,6 +1219,7 @@ async function uploadMediaForProduct(args: {
     }
 
     const buf = await file.arrayBuffer();
+    if (cancelFlag.cancelled) throw new DOMException('已取消', 'AbortError');
     const uploaded = await callInjected<UploadedMedia>({
       type: 'UPLOAD_MEDIA',
       payload: { shopId: targetShopId, kind, mime, bytesBase64: bytesToBase64(buf) },
@@ -1164,13 +1230,14 @@ async function uploadMediaForProduct(args: {
     // 美团对上传图做服务端重编码,目标 URL 下载回来的字节 hash 跟源文件必然不同,
     // 不记下来的话,"修改前对比"里这张图永远对不上 → 每次都误判"已修改"。
     // 下载目标 URL 的开销复用 urlHashCache(对比阶段本来也要下),命中即免重下。
-    if (urlHashCache && uploaded.fileUrl) {
+    if (uploaded.fileUrl) {
       try {
         const targetHash = await urlHashCache.getOrCompute(
           uploaded.fileUrl,
           fetchUrlAsArrayBuffer,
         );
         urlHashCache.recordUploadEquiv(hash, targetHash);
+        await rememberStoreImage(targetShopId, hash, uploaded, targetHash);
       } catch (e) {
         // 算目标 hash 失败不致命:大不了这张图这次仍走 update,下次再补
         log.warn(`登记上传等价失败(忽略): ${hash} → ${uploaded.fileUrl}`, e);
@@ -1402,6 +1469,7 @@ export async function lookupExistingForProduct(
   callInjected: CallInjected,
   targetShopId: string | number,
   spu: ProductSpu,
+  scope: 'tenant' | 'store' = 'tenant',
 ): Promise<{ spuId: string | number; reason: string } | null> {
   // 1) 收集本商品所有 UPC
   const upcSet = new Set<string>();
@@ -1423,13 +1491,11 @@ export async function lookupExistingForProduct(
       total: number;
     }>({
       type: 'FETCH_PRODUCT_LIST',
-      payload: { shopId: targetShopId, pageNo: 1, pageSize: 20, upcList },
+      payload: { shopId: targetShopId, scope, pageNo: 1, pageSize: 20, upcList },
     });
-    if (page.list.length > 0) {
-      // 后端按"任一 UPC 匹配"返回,取第一个命中即可
-      const hit = page.list[0];
-      const matchedUpc = (hit.upcList ?? []).find((u) => upcSet.has(u)) ?? upcList[0];
-      return { spuId: hit.spuId, reason: `UPC=${matchedUpc}` };
+    for (const hit of page.list) {
+      const matchedUpc = (hit.upcList ?? []).find((u) => upcSet.has(u));
+      if (matchedUpc) return { spuId: hit.spuId, reason: `UPC=${matchedUpc}` };
     }
   }
 
@@ -1448,7 +1514,7 @@ export async function lookupExistingForProduct(
           total: number;
         }>({
           type: 'FETCH_PRODUCT_LIST',
-          payload: { shopId: targetShopId, pageNo, pageSize, spuName: spu.name },
+          payload: { shopId: targetShopId, scope, pageNo, pageSize, spuName: spu.name },
         });
         const exact = page.list.find((it) => normalizeName(it.name) === target);
         if (exact) return { spuId: exact.spuId, reason: '同名' };
@@ -1480,8 +1546,8 @@ async function fetchTargetDetailForUpdate(
   callInjected: CallInjected,
   targetShopId: string | number,
   targetSpuId: string | number,
-): Promise<unknown> {
-  const r = await callInjected<{ raw?: { detail?: unknown } }>({
+): Promise<TargetImageDetail> {
+  const r = await callInjected<{ raw?: { detail?: TargetImageDetail } }>({
     type: 'FETCH_PRODUCT_DETAIL',
     payload: { shopId: targetShopId, spuId: targetSpuId },
   });

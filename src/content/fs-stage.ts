@@ -12,7 +12,7 @@
  * 这一层只暴露薄薄一层 IO 原语,业务编排放在 export.ts / import.ts 各自的主流程。
  */
 
-/* eslint-disable @typescript-eslint/no-explicit-any */
+import type { ExportManifest, ProductSpu } from '@shared/types';
 
 /** 浏览器目前对 File System Access 的类型未必齐全,这里给一个最小子集 */
 type FsDirectoryHandle = FileSystemDirectoryHandle & {
@@ -21,43 +21,43 @@ type FsDirectoryHandle = FileSystemDirectoryHandle & {
 
 /** 让用户挑一个目录(必须发生在用户手势中,否则浏览器会拒绝) */
 export async function pickDirectory(
-  options?: { id?: string; mode?: 'read' | 'readwrite' },
+  options?: { id?: string; mode?: 'read' | 'readwrite'; startIn?: FileSystemDirectoryHandle },
 ): Promise<FsDirectoryHandle> {
   const w = window as unknown as {
     showDirectoryPicker?: (opts?: {
       id?: string;
       mode?: 'read' | 'readwrite';
-      startIn?: string;
+      startIn?: FileSystemDirectoryHandle;
     }) => Promise<FileSystemDirectoryHandle>;
   };
   if (!w.showDirectoryPicker) {
     throw new Error('当前浏览器不支持 File System Access(需要 Chromium 86+)');
   }
-  const handle = await w.showDirectoryPicker({
-    id: options?.id ?? 'qnh-export-dir',
+  return w.showDirectoryPicker({
+    id: options?.id ?? (options?.startIn ? undefined : 'qnh-export-dir'),
+    startIn: options?.startIn,
     mode: options?.mode ?? 'readwrite',
   });
-  // 二次确认权限(showDirectoryPicker 通常已经给了,但保险一手)
-  await ensurePermission(handle, options?.mode ?? 'readwrite');
-  return handle as FsDirectoryHandle;
 }
 
-/** 在已有 handle 上确保具备所需权限,缺失则申请;申请同样要求用户手势 */
+type AccessMode = 'read' | 'readwrite';
+type PermissionHandle = FileSystemHandle & {
+  queryPermission: (options: { mode: AccessMode }) => Promise<PermissionState>;
+  requestPermission: (options: { mode: AccessMode }) => Promise<PermissionState>;
+};
+
+export function directoryPermission(handle: FileSystemHandle, mode: AccessMode) {
+  return (handle as PermissionHandle).queryPermission({ mode });
+}
+
+/** 仅在用户点击后调用；权限仍有效时直接返回。 */
 export async function ensurePermission(
   handle: FileSystemHandle,
-  mode: 'read' | 'readwrite',
+  mode: AccessMode,
 ): Promise<void> {
-  const h = handle as FileSystemHandle & {
-    queryPermission?: (d: { mode: string }) => Promise<PermissionState>;
-    requestPermission?: (d: { mode: string }) => Promise<PermissionState>;
-  };
-  if (h.queryPermission) {
-    const cur = await h.queryPermission({ mode });
-    if (cur === 'granted') return;
-  }
-  if (h.requestPermission) {
-    const next = await h.requestPermission({ mode });
-    if (next !== 'granted') throw new Error('未获得目录读写权限');
+  if (await directoryPermission(handle, mode) === 'granted') return;
+  if (await (handle as PermissionHandle).requestPermission({ mode }) !== 'granted') {
+    throw new DOMException('未获得目录访问权限。', 'NotAllowedError');
   }
 }
 
@@ -176,6 +176,35 @@ export async function listFileNames(
   return out;
 }
 
+/** 复用目录时，只读取本次导出的商品，避免混入之前的文件。 */
+export async function listProductFiles(dir: FileSystemDirectoryHandle, manifest: ExportManifest) {
+  if (manifest.productIds) return manifest.productIds.map(id => `${id}.json`);
+  return (await listFileNames(dir)).filter(name => name.endsWith('.json'));
+}
+
+/** 先校验整个导出包，确保导入和库存同步不会把残缺的数据当成完整任务。 */
+export async function readExportedProducts(dir: FileSystemDirectoryHandle, manifest: ExportManifest) {
+  const names = await listProductFiles(dir, manifest);
+  if (names.length !== manifest.productCount) {
+    throw new Error(`导出清单记录了 ${manifest.productCount} 个商品，products 中有 ${names.length} 个商品文件，请检查目录。`);
+  }
+  const products: ProductSpu[] = [];
+  for (const name of names) {
+    try {
+      const file = await (await dir.getFileHandle(name)).getFile();
+      const product = JSON.parse(await file.text()) as ProductSpu;
+      if (!product || product.sourceSpuId == null || name !== `${product.sourceSpuId}.json` ||
+          typeof product.name !== 'string' || !Array.isArray(product.skus)) {
+        throw new Error('商品编号、名称或 SKU 列表无效');
+      }
+      products.push(product);
+    } catch (err) {
+      throw new Error(`无法读取商品 products/${name}，请检查导出目录。 ${(err as Error).message}`);
+    }
+  }
+  return products;
+}
+
 /** 在目录里查一个以 prefix 开头的文件名(媒体按 hash 命名,扩展名变化用前缀匹配) */
 export async function findFileByPrefix(
   dir: FileSystemDirectoryHandle,
@@ -206,7 +235,7 @@ export interface ExportProgressFile {
   schemaVersion: 1;
   createdAt: string;
   source: { shopId: string | number; shopName?: string };
-  options: { includeVideo: boolean; includeImages?: boolean };
+  options: { includeVideo: boolean; includeImages?: boolean; filterKey?: string };
   /** 已写入到 products/<spuId>.json 的源 SPU id 列表 */
   doneSpuIds: string[];
   /** 已写入到 media/ 的内容 hash 列表 */
@@ -217,18 +246,50 @@ export interface ExportProgressFile {
   listFinished: boolean;
 }
 
-/** 检查目录是否已经是一份"已完成"的导出包 */
+/** 只有文件不存在时才视为没有标记，权限或解析错误应展示给用户。 */
+async function readMarker<T>(dir: FileSystemDirectoryHandle, name: string): Promise<T | null> {
+  let handle: FileSystemFileHandle;
+  try {
+    handle = await dir.getFileHandle(name);
+  } catch (err) {
+    if ((err as Error).name === 'NotFoundError') return null;
+    throw err;
+  }
+  const raw = await (await handle.getFile()).text();
+  try {
+    const marker = JSON.parse(raw);
+    if (!marker || typeof marker !== 'object') throw new Error();
+    return marker as T;
+  } catch {
+    throw new Error(`${name} 内容无效，请检查目录。`);
+  }
+}
+
 export async function readManifestIfComplete(
   dir: FileSystemDirectoryHandle,
-): Promise<unknown | null> {
-  return readJsonFile<unknown>(dir, MANIFEST_FILE);
+): Promise<ExportManifest | null> {
+  const manifest = await readMarker<ExportManifest>(dir, MANIFEST_FILE);
+  if (!manifest) return null;
+  if (!manifest.source || !Number.isInteger(manifest.productCount) || manifest.productCount < 0) {
+    throw new Error('manifest.json 缺少有效的导出信息。');
+  }
+  const ids = manifest.productIds;
+  if (ids !== undefined && (!Array.isArray(ids) || ids.length !== manifest.productCount ||
+      !ids.every(id => typeof id === 'string' && id.length > 0) || new Set(ids).size !== ids.length)) {
+    throw new Error('manifest.json 的商品清单无效。');
+  }
+  return manifest;
 }
 
 /** 读续传进度,无返回 null */
-export function readExportProgress(
+export async function readExportProgress(
   dir: FileSystemDirectoryHandle,
 ): Promise<ExportProgressFile | null> {
-  return readJsonFile<ExportProgressFile>(dir, PROGRESS_FILE);
+  const progress = await readMarker<ExportProgressFile>(dir, PROGRESS_FILE);
+  if (progress && (!progress.source || !progress.options || !Array.isArray(progress.doneSpuIds) || !Array.isArray(progress.queue))) {
+    throw new Error('导出进度文件无效，请检查目录。');
+  }
+  return progress;
 }
 
 /**

@@ -9,7 +9,7 @@
  *
  * 逐个 SPU 串行处理:
  *   1) 用导入同款规则 lookupExistingForProduct 在目标门店找到对应 SPU(UPC → 商品名)。
- *   2) 拉目标商品详情,按 UPC 把源 SKU 对齐到目标 SKU(数量一致时回退按顺序对齐)。
+ *   2) 拉目标商品详情,按 UPC 把源 SKU 对齐到目标 SKU(单规格商品可直接对齐)。
  *   3) 同步零售价:adjustSkuOnlinePriceSyncStrategy(固定价同时下发渠道 100 / 200)。
  *   4) 同步库存:batchContainer/stockadjustment(按门店 + 目标 SKU 列表,绝对值覆盖)。
  *
@@ -32,8 +32,8 @@ import type { CallInjected } from './index';
 import { lookupExistingForProduct } from './import';
 import {
   getSubdirOrNull,
-  listFileNames,
-  readTextFile,
+  readExportedProducts,
+  readManifestIfComplete,
 } from './fs-stage';
 
 const log = createLogger('sync');
@@ -86,18 +86,9 @@ export async function runSync({
     throw new Error('products 子目录缺失,目录不是有效的导出包');
   }
 
-  const products: ProductSpu[] = [];
-  const fileNames = await listFileNames(productsDir);
-  for (const name of fileNames) {
-    if (!name.endsWith('.json')) continue;
-    const text = await readTextFile(productsDir, name);
-    if (!text) continue;
-    try {
-      products.push(JSON.parse(text) as ProductSpu);
-    } catch (e) {
-      log.warn(`解析商品文件失败,跳过: ${name}`, e);
-    }
-  }
+  const manifest = await readManifestIfComplete(sourceDir);
+  if (!manifest) throw new Error('目录缺少完整的导出清单');
+  const products = await readExportedProducts(productsDir, manifest);
 
   if (products.length === 0) {
     throw new Error('products 目录里没有可解析的商品,无法同步');
@@ -113,6 +104,8 @@ export async function runSync({
 
   const summary: SyncSummary = {
     kind: 'sync',
+    productFailed: 0,
+    cancelled: false,
     shopId,
     shopName,
     syncedStock: syncStock,
@@ -147,7 +140,7 @@ export async function runSync({
 
     try {
       // ---- 2.1) 用导入同款规则在目标门店找到对应 SPU(UPC → 商品名) ----
-      const matched = await lookupExistingForProduct(callInjected, shopId, spu);
+      const matched = await lookupExistingForProduct(callInjected, shopId, spu, 'store');
       if (!matched) {
         summary.productNotFound++;
         emitLog('warn', `${spu.name} · 目标门店未匹配到(UPC / 商品名都没命中),跳过`);
@@ -157,11 +150,12 @@ export async function runSync({
 
       // ---- 2.2) 拉目标商品详情,准备 SKU 对齐 ----
       const targetSkus = await fetchTargetSkus(callInjected, shopId, matched.spuId);
+      if (cancelFlag.cancelled) break;
 
       const notes: string[] = [`匹配:${matched.reason}`];
       let hadError = false;
 
-      // ---- 2.3) 把源 SKU 对齐到目标 SKU(按 UPC,数量一致时回退按顺序) ----
+      // ---- 2.3) 把源 SKU 对齐到目标 SKU(按 UPC、规格名；单规格可直接对齐) ----
       const aligned = alignSkus(spu, targetSkus);
 
       // ---- 2.4) 零售价 ----
@@ -234,6 +228,7 @@ export async function runSync({
 
       emitLog(hadError ? 'error' : 'success', `${spu.name} · ${notes.join(' · ')}`);
     } catch (e) {
+      summary.productFailed++;
       const msg = (e as Error).message;
       if (!summary.firstError) summary.firstError = msg;
       emitLog('error', `${spu.name} · 处理失败:${msg}`);
@@ -243,6 +238,7 @@ export async function runSync({
   }
 
   summary.finishedAt = new Date().toISOString();
+  summary.cancelled = cancelFlag.cancelled;
   if (cancelFlag.cancelled) {
     log.warn('同步被取消', summary);
   } else {
@@ -295,8 +291,7 @@ interface AlignedSku {
  *   1) 优先按 UPC 交集匹配(一个目标 SKU 只用一次)
  *   2) UPC 未命中的,按「规格名」精确匹配 —— 跨门店 / 跨账号时 UPC(常等于源 skuId)
  *      几乎必然不一致,但规格名(如 "3XL（80-100斤）")是稳定信号,不能退化成按 skuId / 顺序硬对
- *   3) 仍未匹配的源 SKU,在源 / 目标 SKU 数量一致时按剩余顺序兜底对齐
- *      (单规格商品最常见,规格名也偶尔录入不一致时还能救回来)
+ *   3) 仅源、目标各一个 SKU 时直接对齐
  */
 function alignSkus(spu: ProductSpu, targetSkus: TargetSku[]): AlignedSku[] {
   const sourceSkus = spu.skus ?? [];
@@ -324,45 +319,25 @@ function alignSkus(spu: ProductSpu, targetSkus: TargetSku[]): AlignedSku[] {
     return normalizeName((s.specs ?? []).map((x) => x.value).join(''));
   });
 
-  // 1) UPC 交集匹配(最强信号)
-  for (let i = 0; i < sourceSkus.length; i++) {
-    const srcUpcs = sourceUpcSets[i];
-    if (srcUpcs.size === 0) continue;
-    const tIdx = targetSkus.findIndex(
-      (t, idx) => !usedTarget.has(idx) && hasIntersection(srcUpcs, t.upcs),
-    );
-    if (tIdx >= 0) {
-      usedTarget.add(tIdx);
-      result[i].target = targetSkus[tIdx];
+  // 每一轮都要求双向唯一，同一条码对应多个规格时再尝试用规格名消歧。
+  function matchUnique(matches: (sourceIndex: number, target: TargetSku) => boolean) {
+    const candidates = sourceSkus.map((_, i) => result[i].target ? [] : targetSkus
+      .map((target, j) => !usedTarget.has(j) && matches(i, target) ? j : -1)
+      .filter(j => j >= 0));
+    const uses = new Map<number, number>();
+    for (const list of candidates) {
+      for (const j of list) uses.set(j, (uses.get(j) ?? 0) + 1);
     }
+    candidates.forEach((list, i) => {
+      if (list.length !== 1 || uses.get(list[0]) !== 1) return;
+      usedTarget.add(list[0]);
+      result[i].target = targetSkus[list[0]];
+    });
   }
 
-  // 2) 规格名精确匹配(UPC 未命中时):跨账号 UPC 不一致但规格名一致是常态,
-  //    按名称对齐才能把库存 / 价格写到正确的目标 SKU 上。
-  for (let i = 0; i < sourceSkus.length; i++) {
-    if (result[i].target) continue;
-    const name = sourceSpecNames[i];
-    if (!name) continue;
-    const tIdx = targetSkus.findIndex(
-      (t, idx) => !usedTarget.has(idx) && !!t.specName && t.specName === name,
-    );
-    if (tIdx >= 0) {
-      usedTarget.add(tIdx);
-      result[i].target = targetSkus[tIdx];
-    }
-  }
-
-  // 3) 数量一致时,剩余未匹配的按顺序兜底对齐
-  if (sourceSkus.length === targetSkus.length) {
-    for (let i = 0; i < sourceSkus.length; i++) {
-      if (result[i].target) continue;
-      const tIdx = targetSkus.findIndex((_t, idx) => !usedTarget.has(idx));
-      if (tIdx >= 0) {
-        usedTarget.add(tIdx);
-        result[i].target = targetSkus[tIdx];
-      }
-    }
-  }
+  matchUnique((i, target) => hasIntersection(sourceUpcSets[i], target.upcs));
+  matchUnique((i, target) => !!sourceSpecNames[i] && sourceSpecNames[i] === target.specName);
+  if (sourceSkus.length === 1 && targetSkus.length === 1) result[0].target = targetSkus[0];
 
   return result;
 }

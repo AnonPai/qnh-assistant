@@ -13,7 +13,6 @@
  * - 进度面板与确认弹窗用 Shadow DOM 包裹,样式与宿主页面隔离
  */
 
-import { createLogger } from '@shared/logger';
 import type { ProgressEvent } from '@shared/messaging';
 import type { CategoryMapping } from '@shared/types';
 import {
@@ -25,8 +24,6 @@ import {
   subscribeProgress,
 } from './index';
 import { openExportForm, openImportForm, openSyncForm } from './config-forms';
-
-const log = createLogger('inpage');
 
 const BTN_EXPORT_TEXT = '📦 导出本店商品';
 const BTN_IMPORT_TEXT = '📥 导入商品';
@@ -66,9 +63,7 @@ export function mountInPageUI() {
     scheduled = true;
     requestAnimationFrame(() => {
       scheduled = false;
-      injectSyncButton();
-      injectExportButton();
-      injectImportButton();
+      mountToolbar();
     });
   };
   tryMount();
@@ -81,137 +76,34 @@ export function mountInPageUI() {
   window.addEventListener('popstate', tryMount);
 }
 
-/** 注入导出按钮到「新增商品」按钮的左边 */
-function injectExportButton() {
-  if (!isExportRoute()) {
-    document.querySelector(`[data-qnh="${MARK_EXPORT_BTN}"]`)?.remove();
-    return;
+function mountToolbar() {
+  const actions = [
+    { mark: MARK_SYNC_BTN, label: BTN_SYNC_TEXT, visible: isExportRoute(), click: onSyncClick },
+    { mark: MARK_EXPORT_BTN, label: BTN_EXPORT_TEXT, visible: isExportRoute(), click: onExportClick },
+    { mark: MARK_IMPORT_BTN, label: BTN_IMPORT_TEXT, visible: isImportRoute(), click: onImportClick },
+    { mark: 'qnh-store-import-btn', label: '导入本店商品', visible: isExportRoute(), click: () => onImportClick(true) },
+  ];
+  let anchor: HTMLElement | null = null;
+  for (const action of actions) {
+    const existing = document.querySelector(`[data-qnh="${action.mark}"]`);
+    if (!action.visible) {
+      existing?.remove();
+      continue;
+    }
+    if (existing) continue;
+    anchor ??= findAddProductButton();
+    if (!anchor?.parentElement) continue;
+    const wrapper = document.createElement('span');
+    wrapper.className = anchor.className;
+    wrapper.dataset.qnh = action.mark;
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.textContent = action.label;
+    button.style.cssText = 'height:32px;padding:0 12px;border:1px solid #a8c6bb;border-radius:7px;background:#f2f8f5;color:#185d50;font-size:13px;cursor:pointer;';
+    button.addEventListener('click', () => void openTask(action.click));
+    wrapper.append(button);
+    anchor.before(wrapper);
   }
-  if (document.querySelector(`[data-qnh="${MARK_EXPORT_BTN}"]`)) return;
-
-  const anchor = findAddProductButton();
-  if (!anchor) return;
-  const toolbar = anchor.parentElement;
-  if (!toolbar) return;
-
-  const wrapper = document.createElement(anchor.tagName.toLowerCase());
-  wrapper.className = anchor.className; // 复制 ant-space-item 等
-  wrapper.dataset.qnh = MARK_EXPORT_BTN;
-
-  const btn = document.createElement('button');
-  btn.type = 'button';
-  btn.textContent = BTN_EXPORT_TEXT;
-  btn.style.cssText = [
-    'display:inline-flex',
-    'align-items:center',
-    'gap:4px',
-    'height:32px',
-    'padding:0 14px',
-    'border:1px solid #faad14',
-    'background:#fff7e6',
-    'color:#d48806',
-    'border-radius:4px',
-    'font-size:13px',
-    'cursor:pointer',
-    'line-height:1',
-  ].join(';');
-  btn.addEventListener('mouseenter', () => (btn.style.background = '#ffe7ba'));
-  btn.addEventListener('mouseleave', () => (btn.style.background = '#fff7e6'));
-  btn.addEventListener('click', onExportClick);
-
-  wrapper.appendChild(btn);
-  toolbar.insertBefore(wrapper, anchor);
-  log.info('已注入导出按钮', { toolbarClass: toolbar.className });
-}
-
-/**
- * 注入「同步库存价格」按钮到导出按钮的左边(同样只在门店商品列表显示)。
- * 锚点优先用已注入的导出按钮 wrapper,这样始终位于"导出本店商品"左侧;
- * 导出按钮还没注入时回退到「新增商品」按钮。
- */
-function injectSyncButton() {
-  if (!isExportRoute()) {
-    document.querySelector(`[data-qnh="${MARK_SYNC_BTN}"]`)?.remove();
-    return;
-  }
-  if (document.querySelector(`[data-qnh="${MARK_SYNC_BTN}"]`)) return;
-
-  const exportWrapper = document.querySelector<HTMLElement>(`[data-qnh="${MARK_EXPORT_BTN}"]`);
-  const anchor = exportWrapper ?? findAddProductButton();
-  if (!anchor) return;
-  const toolbar = anchor.parentElement;
-  if (!toolbar) return;
-
-  const wrapper = document.createElement(anchor.tagName.toLowerCase());
-  wrapper.className = anchor.className;
-  wrapper.dataset.qnh = MARK_SYNC_BTN;
-
-  const btn = document.createElement('button');
-  btn.type = 'button';
-  btn.textContent = BTN_SYNC_TEXT;
-  btn.style.cssText = [
-    'display:inline-flex',
-    'align-items:center',
-    'gap:4px',
-    'height:32px',
-    'padding:0 14px',
-    'border:1px solid #13c2c2',
-    'background:#e6fffb',
-    'color:#08979c',
-    'border-radius:4px',
-    'font-size:13px',
-    'cursor:pointer',
-    'line-height:1',
-  ].join(';');
-  btn.addEventListener('mouseenter', () => (btn.style.background = '#b5f5ec'));
-  btn.addEventListener('mouseleave', () => (btn.style.background = '#e6fffb'));
-  btn.addEventListener('click', onSyncClick);
-
-  wrapper.appendChild(btn);
-  toolbar.insertBefore(wrapper, anchor);
-  log.info('已注入同步库存价格按钮');
-}
-
-/** 注入导入按钮到「新增商品」按钮的左边(仅主档列表) */
-function injectImportButton() {  if (!isImportRoute()) {
-    document.querySelector(`[data-qnh="${MARK_IMPORT_BTN}"]`)?.remove();
-    return;
-  }
-  if (document.querySelector(`[data-qnh="${MARK_IMPORT_BTN}"]`)) return;
-
-  const anchor = findAddProductButton();
-  if (!anchor) return;
-  const toolbar = anchor.parentElement;
-  if (!toolbar) return;
-
-  const wrapper = document.createElement(anchor.tagName.toLowerCase());
-  wrapper.className = anchor.className;
-  wrapper.dataset.qnh = MARK_IMPORT_BTN;
-
-  const btn = document.createElement('button');
-  btn.type = 'button';
-  btn.textContent = BTN_IMPORT_TEXT;
-  btn.style.cssText = [
-    'display:inline-flex',
-    'align-items:center',
-    'gap:4px',
-    'height:32px',
-    'padding:0 14px',
-    'border:1px solid #52c41a',
-    'background:#f6ffed',
-    'color:#389e0d',
-    'border-radius:4px',
-    'font-size:13px',
-    'cursor:pointer',
-    'line-height:1',
-  ].join(';');
-  btn.addEventListener('mouseenter', () => (btn.style.background = '#d9f7be'));
-  btn.addEventListener('mouseleave', () => (btn.style.background = '#f6ffed'));
-  btn.addEventListener('click', onImportClick);
-
-  wrapper.appendChild(btn);
-  toolbar.insertBefore(wrapper, anchor);
-  log.info('已注入导入按钮');
 }
 
 /**
@@ -346,7 +238,12 @@ async function onExportClick() {
 
   // 「重新开始」需要先把目录里的旧进度文件清掉,免得 runExport 当成续传
   if (result.startMode === 'overwrite') {
-    await clearStaleProgress(result.targetDir);
+    try {
+      await clearStaleProgress(result.targetDir);
+    } catch (err) {
+      showPanel({ title: '无法重新导出', body: (err as Error).message, tone: 'error' });
+      return;
+    }
   }
 
   showPanel({
@@ -360,7 +257,7 @@ async function onExportClick() {
     }`,
     tone: 'info',
   });
-  startExport({
+  await startExport({
     sourceShopId: result.shop.shopId,
     sourceShopName: result.shop.shopName,
     includeImages: result.includeImages,
@@ -391,7 +288,7 @@ async function onSyncClick() {
     tone: 'info',
   });
 
-  startSync({
+  await startSync({
     shopId: result.shop.shopId,
     shopName: result.shop.shopName,
     syncStock: result.syncStock,
@@ -404,12 +301,12 @@ async function onSyncClick() {
    导入按钮:打开单页表单 → 用户填完一次性提交
    ============================================================ */
 
-async function onImportClick() {
-  const result = await openImportForm();
+async function onImportClick(store = false) {
+  const result = await openImportForm(store ? callInjected : undefined);
   if (!result) return;
 
   showPanel({
-    title: `导入数据 · 准备中`,
+    title: result.shop ? `导入 ${result.shop.shopName ?? result.shop.shopId} · 准备中` : '导入数据 · 准备中',
     body: `源目录:${result.sourceDir.name} · ${result.mode === 'full' ? '全量' : '增量'} · ${
       result.confirmMode === 'auto' ? '自动' : '手动'
     } · ${result.syncImages ? '同步图片' : '不同步图片'}${
@@ -421,7 +318,8 @@ async function onImportClick() {
   });
 
   const mapping: CategoryMapping = {};
-  startImport({
+  await startImport({
+    store: result.shop && { shopId: result.shop.shopId, purchaseUnitPrice: result.purchaseUnitPrice },
     sourceDir: result.sourceDir,
     mapping,
     mode: result.mode,
@@ -443,8 +341,8 @@ async function clearStaleProgress(dir: FileSystemDirectoryHandle): Promise<void>
   for (const name of ['.qnh-progress.json', 'manifest.json']) {
     try {
       await dir.removeEntry(name);
-    } catch {
-      /* 不存在就忽略 */
+    } catch (err) {
+      if ((err as Error).name !== 'NotFoundError') throw err;
     }
   }
 }
@@ -453,12 +351,23 @@ async function clearStaleProgress(dir: FileSystemDirectoryHandle): Promise<void>
    外部入口:popup 发现自己拿不到用户手势时,回退到"在页面里打开入口"
    ============================================================ */
 
-export function openInPageEntry(kind: 'export' | 'import') {
-  if (kind === 'export') {
-    void onExportClick();
-  } else {
-    void onImportClick();
+let taskOpen = false;
+
+async function openTask(action: () => Promise<void>) {
+  if (taskOpen) {
+    shadow?.querySelector('.qnh-card')?.classList.remove('qnh-hidden');
+    return;
   }
+  taskOpen = true;
+  try {
+    await action();
+  } finally {
+    taskOpen = false;
+  }
+}
+
+export function openInPageEntry(kind: 'export' | 'import') {
+  void openTask(kind === 'export' ? onExportClick : onImportClick);
 }
 
 /* ============================================================
@@ -499,6 +408,7 @@ function showPanel(init: PanelInit) {
   cardEl.dataset.tone = init.tone ?? 'info';
   cardEl.classList.remove('qnh-hidden');
 
+  root.querySelector<HTMLElement>('.qnh-bar > div')!.style.width = '0%';
   // 新任务开启:清空日志列表
   resetPanelLogs(root);
 
@@ -567,9 +477,10 @@ function onProgress(root: ShadowRoot, e: ProgressEvent) {
   } else if (e.kind === 'done') {
     if ('kind' in e.result) {
       const r = e.result;
-      const failed = r.priceFailed > 0 || r.stockFailed > 0;
-      titleEl.textContent = failed ? '同步完成(有失败)' : '同步完成 ✓';
+      const failed = r.productFailed > 0 || r.priceFailed > 0 || r.stockFailed > 0;
+      titleEl.textContent = r.cancelled ? '同步已取消' : failed ? '同步完成(有失败)' : '同步完成 ✓';
       const parts = [`商品 ${r.productProcessed}/${r.productTotal}`];
+      if (r.productFailed > 0) parts.push(`商品处理失败 ${r.productFailed}`);
       if (r.productNotFound > 0) parts.push(`未匹配 ${r.productNotFound}`);
       if (r.syncedPrice) {
         parts.push(`零售价 成功 ${r.priceOk}·失败 ${r.priceFailed}·跳过 ${r.priceSkipped}`);
@@ -581,17 +492,19 @@ function onProgress(root: ShadowRoot, e: ProgressEvent) {
       if (r.firstError) body += `\n首个错误: ${r.firstError}`;
       bodyEl.textContent = body;
       bodyEl.style.whiteSpace = 'pre-wrap';
-      barEl.style.width = '100%';
-      cardEl.dataset.tone = failed ? 'error' : 'success';
+      if (!r.cancelled) barEl.style.width = '100%';
+      cardEl.dataset.tone = failed ? 'error' : r.cancelled ? 'info' : 'success';
       return;
     }
     if ('fileName' in e.result) {
+      cardEl.dataset.tone = 'success';
       titleEl.textContent = '导出完成 ✓';
-      bodyEl.textContent = `已生成 ${e.result.fileName},请检查下载目录。`;
+      bodyEl.textContent = `${e.result.manifest.productCount} 个商品已写入「${e.result.fileName}」。`;
     } else {
       const r = e.result;
       const failed = r.failed > 0;
-      titleEl.textContent = failed ? '导入完成(有失败)' : '导入完成 ✓';
+      titleEl.textContent = r.cancelled ? '导入已取消' : failed ? '导入完成(有失败)' : '导入完成 ✓';
+      cardEl.dataset.tone = failed ? 'error' : r.cancelled ? 'info' : 'success';
       const parts = [`共 ${r.total}`, `新建 ${r.succeeded}`];
       if (r.updated > 0) parts.push(`修改 ${r.updated}`);
       if (r.skipped > 0) parts.push(`跳过 ${r.skipped}`);
@@ -605,13 +518,14 @@ function onProgress(root: ShadowRoot, e: ProgressEvent) {
       }
       bodyEl.textContent = body;
       bodyEl.style.whiteSpace = 'pre-wrap';
+      if (r.cancelled) return;
     }
     barEl.style.width = '100%';
-    cardEl.dataset.tone = 'success';
   } else if (e.kind === 'error') {
-    titleEl.textContent = '出错了';
+    const cancelled = e.message === '已取消';
+    titleEl.textContent = cancelled ? '任务已取消' : '出错了';
     bodyEl.textContent = e.message;
-    cardEl.dataset.tone = 'error';
+    cardEl.dataset.tone = cancelled ? 'info' : 'error';
   }
 }
 
@@ -659,10 +573,6 @@ function appendPanelLog(
 function bindPanelEvents(root: ShadowRoot) {
   root.querySelector('.qnh-close')?.addEventListener('click', () => {
     (root.querySelector('.qnh-card') as HTMLElement).classList.add('qnh-hidden');
-    if (unsub) {
-      unsub();
-      unsub = null;
-    }
   });
   root.querySelector('.qnh-cancel')?.addEventListener('click', () => {
     cancelCurrent();
@@ -677,7 +587,7 @@ function panelHTML(): string {
         position: fixed;
         right: 20px;
         bottom: 20px;
-        width: 380px;
+        width: min(380px, calc(100vw - 40px));
         background: #fff;
         border: 1px solid #e6e8eb;
         border-radius: 8px;
@@ -717,7 +627,7 @@ function panelHTML(): string {
       .qnh-bar > div {
         height: 100%;
         width: 0%;
-        background: #1677ff;
+        background: #12675b;
         transition: width .25s ease;
       }
       .qnh-card[data-tone="success"] .qnh-bar > div { background: #52c41a; }
@@ -803,6 +713,7 @@ function panelHTML(): string {
 const MARK_CONFIRM = 'qnh-import-confirm';
 
 export function requestImportConfirm(info: {
+  signal?: AbortSignal;
   productName: string;
   productCurrent: number;
   productTotal: number;
@@ -936,7 +847,13 @@ export function requestImportConfirm(info: {
         dispose('skip');
       }
     };
-    const cleanup = () => window.removeEventListener('keydown', onKey, true);
+    const cancel = () => dispose('cancel-all');
+    const cleanup = () => {
+      window.removeEventListener('keydown', onKey, true);
+      info.signal?.removeEventListener('abort', cancel);
+    };
     window.addEventListener('keydown', onKey, true);
+    if (info.signal?.aborted) cancel();
+    else info.signal?.addEventListener('abort', cancel, { once: true });
   });
 }

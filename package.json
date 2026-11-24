@@ -1,10 +1,11 @@
 {
   "name": "qnh-assistant",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "private": true,
   "description": "美团牵牛花跨账号商品同步助手 (Edge 插件)",
   "type": "module",
   "scripts": {
+    "test": "node --test tests/product-workflows.test.mjs",
     "dev": "node scripts/build.mjs --dev --watch",
     "start": "node scripts/build.mjs --watch",
     "build": "tsc -b --noEmit && node scripts/build.mjs",

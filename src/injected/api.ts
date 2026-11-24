@@ -27,6 +27,7 @@
  */
 
 import { base64ToBytes } from '@shared/hash';
+import { jdStoreSpecs } from '@shared/store-specs';
 import type {
   CategorySnapshot,
   ProductSpu,
@@ -93,7 +94,9 @@ function qnhApiPath(path: string): string {
  * 如果遇到签名拦截器没自动生效的情况,可以改成 await window.fetch(...)
  * 或者寻找页面上的 ajax 工具(如 window.__APP__.request)。
  */
-async function siteFetch<T = unknown>(input: RequestInfo, init?: RequestInit): Promise<T> {
+async function siteFetch<T = unknown>(
+  input: RequestInfo, init?: RequestInit, parseJson?: (text: string) => T,
+): Promise<T> {
   if (typeof input === 'string') rememberCsecVersionFromUrl(input);
   else rememberCsecVersionFromUrl(input.url);
   const res = await fetch(input, {
@@ -106,7 +109,7 @@ async function siteFetch<T = unknown>(input: RequestInfo, init?: RequestInit): P
   });
   if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText} @ ${typeof input === 'string' ? input : input.url}`);
   const ct = res.headers.get('content-type') || '';
-  if (ct.includes('application/json')) return (await res.json()) as T;
+  if (ct.includes('application/json')) return parseJson ? parseJson(await res.text()) : (await res.json()) as T;
   return (await res.text()) as unknown as T;
 }
 
@@ -576,6 +579,7 @@ interface RawProductDetail {
   /** ERP 拓展字段,update 时回写需要保留 */
   erpTenantSpuExtend?: unknown;
   backendCategoryCode?: string;
+  backendCategory?: { categoryCode?: string | number | null } | null;
   /** 配送要求 */
   deliveryRequirement?: number | string;
   /** 其他扩展字段(留作占位/调试) */
@@ -593,7 +597,9 @@ interface RawTenantSku {
   saleUnit?: string;
   /** 售价相关:tenant 维度只有「建议售价」(没有店内的 storePrice / onlinePrice) */
   suggestPrice?: {
-    tenantSuggestPrice?: { unifiedSuggestPrice?: string };
+    tenantSuggestPrice?: { unifiedSuggestPrice?: string | null; channelSuggestPriceList?: Array<{
+      channelId: string | number; suggestPrice: string | number;
+    }> | null };
     areaSuggestPriceList?: unknown;
     skuId?: string | number;
     clean?: unknown;
@@ -1025,6 +1031,7 @@ interface CreateProductResp {
 }
 
 export async function createProduct(payload: {
+  scope?: 'store';
   shopId: string | number;
   product: ProductSpu;
   /** hash → 目标账号上传后得到的 fileUrl/originFileUrl */
@@ -1036,7 +1043,6 @@ export async function createProduct(payload: {
   frontCategoryIdRemap?: Record<string, string>;
 }): Promise<string | number> {
   const { product, mediaIdMap, childSkuMap, frontCategoryIdRemap } = payload;
-  void payload.shopId; // tenant/create/v2 不需要门店上下文,但保留参数与 messaging 协议一致
   void payload.targetCategoryPath; // 类目路径已经在 raw.detail.channelSpuList 里,不需要外部覆盖
 
   // ---- 1) 替换媒体占位符 ----
@@ -1070,6 +1076,9 @@ export async function createProduct(payload: {
     frontCategoryIdRemap,
   });
 
+  if (payload.scope === 'store') {
+    return createStoreProduct(payload.shopId, replaced, detail, tenantSpu);
+  }
   const body = {
     tenantSpu,
     dataType: 1,
@@ -1091,6 +1100,107 @@ export async function createProduct(payload: {
     throw new Error(`创建商品失败: code=${resp?.code} msg=${resp?.msg ?? 'unknown'}`);
   }
   return resp.data.spuId;
+}
+
+const storeCreateHeaders = { ...QNH_GW_HEADERS, qnhreferrer: '/unifiedGoods/store/create' };
+
+function numericStoreId(value: string | number) {
+  const id = Number(value);
+  if (!Number.isSafeInteger(id) || id <= 0) throw new Error('目标门店编号无效');
+  return id;
+}
+
+function storeRetailPrice(sku: RawTenantSku, exportedPrice?: number) {
+  const hq = sku.suggestPrice?.tenantSuggestPrice;
+  const channels = hq?.channelSuggestPriceList ?? [];
+  const positive = (p: unknown) => Number.isFinite(Number(p)) && Number(p) > 0;
+  if (channels.length) {
+    if (channels.some(c => !positive(c.suggestPrice) || !positive(c.channelId))) {
+      throw new Error(`规格「${sku.specName ?? ''}」的分渠道总部零售价不完整`);
+    }
+    const list = channels.map(c => ({ channelId: c.channelId, suggestPrice: String(Number(c.suggestPrice)) }));
+    if (!list.every(c => c.suggestPrice === list[0].suggestPrice)) {
+      return { tenantSuggestPrice: { channelSuggestPriceList: list } };
+    }
+    return { tenantSuggestPrice: { unifiedSuggestPrice: list[0].suggestPrice } };
+  }
+  const price = [hq?.unifiedSuggestPrice, exportedPrice, sku.basicPrice].find(positive);
+  if (price == null) throw new Error(`规格「${sku.specName ?? ''}」缺少有效的总部零售价`);
+  return { tenantSuggestPrice: { unifiedSuggestPrice: String(Number(price)) } };
+}
+
+async function createStoreProduct(
+  shopId: string | number, product: ProductSpu, detail: RawProductDetail, mapped: Record<string, unknown>,
+): Promise<string | number> {
+  const rawSkus = detail.skus ?? [];
+  if (!rawSkus.length || rawSkus.length !== product.skus.length) throw new Error('门店新建需要完整的 SKU 清单');
+  const jd = jdStoreSpecs(detail);
+  const sources = rawSkus.map((sku, i) => {
+    const source = sku.skuId == null ? product.skus[i] : product.skus.find(s => String(s.sourceSkuId) === String(sku.skuId));
+    if (!source) throw new Error(`门店规格「${sku.specName ?? ''}」缺少对应的导出 SKU`);
+    return source;
+  });
+  // 两份门店新建抓包的 storePrice 都是 9999，即使各 SKU 的总部零售价不同。
+  const skuList = rawSkus.map((s, i) => ({ specName: makeSpecName(s), storePrice: String(sources[i].storePrice ?? 9999), customizeStockFlag: 1 }));
+  const skus = (mapped.skus as Array<Record<string, unknown>>).map((sku, i) => ({
+    ...sku, suggestPrice: storeRetailPrice(rawSkus[i], sources[i].price),
+    skuChannelInfoList: (sku.skuChannelInfoList as Array<Record<string, unknown>>).map(c =>
+      jd && Number(c.channelId) === 300 ? { ...c, saleAttrValueList: jd.values[i] } : c),
+    customizeNoUpcCode: rawSkus[i].customizeNoUpcCode ?? 0,
+    useSkuAsUpc: rawSkus[i].useSkuAsUpc ?? 0, goodsUpcList: rawSkus[i].goodsUpcList ?? [],
+    volume: rawSkus[i].volume ?? { volumeForUnit: null },
+    fourWheelDeliveryThreshold: rawSkus[i].fourWheelDeliveryThreshold ?? null,
+  }));
+  const channels = (mapped.spuChannelInfoList as Array<Record<string, unknown>>).map(c => ({
+    channelId: c.channelId, channelName: c.channelName, categoryCode: c.categoryCode,
+    categoryName: c.categoryName, categoryCodePath: c.categoryCodePath, categoryNamePath: c.categoryNamePath,
+    categoryProperties: c.categoryProperties, saleAttrList: Number(c.channelId) === 300 && jd ? jd.dimensions : c.saleAttrList, skuPicSetting: c.skuPicSetting,
+    brandInfo: c.brandInfo, specialPictureList: c.specialPictureList,
+  }));
+  const tenantSpu = {
+    spuName: product.name, weightType: mapped.weightType, specType: mapped.specType, onlineStatus: mapped.onlineStatus,
+    customizedChannelName: detail.customizedChannelName ?? {}, spuChannelInfoList: channels,
+    picUrlList: mapped.picUrlList, picContentList: mapped.picContentList, videoInfo: mapped.videoInfo ?? null,
+    brand: detail.brand ?? {}, backendCategory: { categoryCode: detail.backendCategory?.categoryCode ?? null },
+    storeFrontCategoryList: mapped.storeFrontCategoryList, matchMedicalStandard: detail.matchMedicalStandard,
+    aiRecommendInfo: detail.aiRecommendInfo ?? {}, otherQualificationInfo: detail.otherQualificationInfo ?? { fileList: [] },
+    sellPoint: detail.sellPoint, description: detail.description, skus,
+  };
+  const resp = await siteFetch<CreateProductResp & { spuId?: string | number; success?: boolean }>(
+    qnhApiPath('/qnh-gw3/api/product/store/create'), {
+      method: 'POST', headers: storeCreateHeaders,
+      body: JSON.stringify({ storeId: numericStoreId(shopId), tenantSpu, storeSpu: { skuList,
+        mtSpecialPictureList: channels.find(c => Number(c.channelId) === 100)?.specialPictureList },
+        adjustStock: { comment: 'WEB-门店商品新增规格调整库存', skuList: [] },
+        source: 2, createType: 3, fieldUpgrade: { newProperty: false } }),
+    }, text => JSON.parse(text, (key, value, context?: { source?: string }) => {
+      // 门店接口可能以 JSON 数字返回 19 位 SPU ID。后续采购请求必须使用原始编号。
+      return key === 'spuId' && typeof value === 'number' && context?.source && /^\d+$/.test(context.source)
+        ? context.source : value;
+    }));
+  if (resp?.code !== 0 || resp.success === false) throw new Error(`门店商品新建失败：${resp?.msg ?? resp?.code}`);
+  const id = resp.spuId ?? resp.data?.spuId;
+  if (typeof id === 'string' && /^[1-9]\d*$/.test(id)) return id;
+  if (typeof id === 'number' && Number.isSafeInteger(id) && id > 0) return id;
+  throw new Error('门店新建已返回成功，但未取得有效的目标商品编号，请到门店核对。');
+}
+
+export async function setNewStorePurchase(payload: import('@shared/messaging').StorePurchaseRequest) {
+  const { shopId, targetSpuId, unitPrice, specs } = payload;
+  if (!specs.length || (unitPrice != null && (!Number.isFinite(unitPrice) || unitPrice <= 0 ||
+      specs.some(s => !s.saleUnit || !s.spec)))) throw new Error('采购单价、规格或销售单位无效');
+  const purchaseInfo = specs.map(({ spec, saleUnit }) => ({
+    skuId: null, spec, purchaseStatus: 1, purchaseType: 1, distributeType: 1, distributeId: null,
+    newSupplyRelations: unitPrice == null ? [] : [{ supplierId: -1, supplyUnit: saleUnit, supplyUnitRatio: 1,
+      baseSupplyUnitPrice: unitPrice, minOrderQuantity: 1, masterFlag: 1, settleMethod: 2,
+      payMethod: 2, orderMultiple: 1, offlineGoods: {} }],
+  }));
+  const resp = await siteFetch<{ code: number; success?: boolean; msg?: string }>(qnhApiPath('/api/v1/store/spu/create'), {
+    method: 'POST', headers: storeCreateHeaders,
+    body: JSON.stringify({ manualCreate: true, newPage: true, storeId: numericStoreId(shopId),
+      storeSpu: { spuId: String(targetSpuId), purchaseInfo } }),
+  });
+  if (resp?.code !== 0 || resp.success === false) throw new Error(resp?.msg ?? '门店采购配置失败');
 }
 
 // ============================================================
@@ -1128,9 +1238,7 @@ export async function updateProduct(payload: {
   void payload.existingMediaIdMap;
 
   // ---- 1) 替换源商品里的 media:// 占位 ----
-  // 修改路径会真实写图片(picUrlList / picContentList / specialPictureList),
-  // 与 create 一样需要把所有引用到的图片上传完毕、得到 fileUrl,缺一不可。
-  // 上层 import.ts 已先调 uploadMediaForProduct 上传图片,这里只做替换。
+  // 导入流程已为图片选好复用或上传后的地址，按源快照的字段和顺序填入。
   const replacedJson = JSON.stringify(product).replace(
     /media:\/\/([a-f0-9]{64})/g,
     (_m, h) => {
@@ -1262,11 +1370,7 @@ function buildTenantSpuV2(
   const ch100 = channelList.find((c) => c.channelId === 100);
 
   // 主图 / 图文详情 / 视频
-  // create / update 统一从 detail(源端,media:// 已被替换成新上传的 fileUrl)派生,
-  // 这样源端图改了就能写到目标店,源端没改、字面相同也没影响(覆盖等价)。
-  // 注意:上层(import.ts)已先调 uploadMediaForProduct 上传源端引用的所有图,
-  // detail 里此时不再有 media:// 占位 —— 万一漏传会触发 createProduct 那条
-  // "媒体未上传"报错路径,update 也复用同一替换逻辑。
+  // create / update 统一使用已解析图片地址的源快照，保留图片顺序及增删。
   const picSource = detail;
   const picUrlList = uniqueStrings(picSource.picUrlList ?? []).filter(Boolean);
   const picContentList = uniqueStrings(picSource.picContentList ?? []).filter(Boolean);
@@ -2195,6 +2299,7 @@ interface StoreDetailResp {
     storeSkuList?: Array<{
       skuId: string | number;
       stock?: string | number | null;
+      storePrice?: string | number | null;
       upc?: string | null;
       upcList?: string[] | null;
       onlinePrice?: string | number | null;
@@ -2251,6 +2356,7 @@ export async function fetchStoreSkuInfo(payload: {
       return {
         skuId: s.skuId,
         stock: parseNum(s.stock),
+        storePrice: parseNum(s.storePrice),
         channelPrices,
         upcList,
       };

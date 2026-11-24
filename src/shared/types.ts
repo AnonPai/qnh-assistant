@@ -30,6 +30,8 @@ export interface SpecOption {
 
 /** SKU */
 export interface ProductSku {
+  /** 门店线下价，旧导出包没有此字段。 */
+  storePrice?: number;
   /** 源系统 SKU id,仅用于 manifest 调试,不传给目标账号 */
   sourceSkuId?: string | number;
   /** 规格组合 */
@@ -97,6 +99,8 @@ export interface ExportManifest {
   };
   /** 商品总数 */
   productCount: number;
+  /** 本次导出的商品；早期导出包需从 products 目录读取清单。 */
+  productIds?: string[];
   /** 媒体总数 */
   mediaCount: number;
 }
@@ -124,6 +128,9 @@ export interface ImportResultItem {
 
 /** 「同步库存 / 零售价」整体结果(从导出目录把每个 SKU 的价格/库存推到目标门店) */
 export interface SyncSummary {
+  cancelled: boolean;
+  /** 商品匹配或读取目标详情失败，尚未执行 SKU 写入。 */
+  productFailed: number;
   /** 判别标记,便于 UI 在 done 事件里和导出 / 导入结果区分 */
   kind: 'sync';
   /** 目标门店 */
@@ -153,6 +160,7 @@ export interface SyncSummary {
 
 /** 整体导入结果 */
 export interface ImportSummary {
+  cancelled: boolean;
   total: number;
   succeeded: number;
   /** 已通过修改接口更新的商品数(全量模式 + UPC 命中) */

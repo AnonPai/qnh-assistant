@@ -61,6 +61,9 @@ window.addEventListener('message', async (ev) => {
       case 'CREATE_PRODUCT':
         result = await api.createProduct(cmd.payload);
         break;
+      case 'SET_NEW_STORE_PURCHASE':
+        result = await api.setNewStorePurchase(cmd.payload);
+        break;
       case 'UPDATE_PRODUCT':
         result = await api.updateProduct(
           cmd.payload as Parameters<typeof api.updateProduct>[0],

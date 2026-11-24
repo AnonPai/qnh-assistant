@@ -93,7 +93,7 @@ export type ProgressEvent =
 
 export interface ExportResult {
   manifest: ExportManifest;
-  /** 文件名占位(目录直写后没有 zip 文件,留个字段方便 UI 兼容旧逻辑) */
+  /** 导出目录名，沿用原消息字段名。 */
   fileName: string;
 }
 
@@ -109,7 +109,8 @@ export type InjectedCommand =
   | { id: string; type: 'FETCH_FRONT_CATEGORY_TREE'; payload: { shopId: string | number } }
   | { id: string; type: 'FETCH_SHOP_INFO' }
   | { id: string; type: 'UPLOAD_MEDIA'; payload: { shopId: string | number; kind: 'image' | 'video'; mime: string; bytesBase64: string } }
-  | { id: string; type: 'CREATE_PRODUCT'; payload: { shopId: string | number; product: ProductSpu; mediaIdMap: Record<string, UploadedMedia>; targetCategoryPath: Array<string | number>; childSkuMap?: Record<string, ChildSkuMapping>; frontCategoryIdRemap?: Record<string, string> } }
+  | { id: string; type: 'CREATE_PRODUCT'; payload: { scope?: 'store'; shopId: string | number; product: ProductSpu; mediaIdMap: Record<string, UploadedMedia>; targetCategoryPath: Array<string | number>; childSkuMap?: Record<string, ChildSkuMapping>; frontCategoryIdRemap?: Record<string, string> } }
+  | { id: string; type: 'SET_NEW_STORE_PURCHASE'; payload: StorePurchaseRequest }
   | { id: string; type: 'UPDATE_PRODUCT'; payload: { product: ProductSpu; mediaIdMap: Record<string, UploadedMedia>; targetSpuId: string | number; targetDetail: unknown; frontCategoryIdRemap?: Record<string, string>; existingMediaIdMap?: Record<string, UploadedMedia>; childSkuMap?: Record<string, ChildSkuMapping> } }
   /** 同步零售价:把一个 SPU 下若干 SKU 的分渠道固定价推到目标门店(adjustSkuOnlinePriceSyncStrategy) */
   | { id: string; type: 'ADJUST_SKU_PRICE'; payload: { storeId: string | number; spuId: string | number; skuPriceList: SkuPriceAdjust[] } }
@@ -133,7 +134,20 @@ export interface SkuStockAdjust {
 }
 
 /** 门店维度某 SKU 的库存 + 分渠道零售价(FETCH_STORE_SKU_INFO 返回项) */
+export interface StoreImportOptions {
+  shopId: string | number;
+  purchaseUnitPrice?: number;
+}
+
+export interface StorePurchaseRequest {
+  shopId: string | number;
+  targetSpuId: string | number;
+  unitPrice?: number;
+  specs: Array<{ spec: string; saleUnit: string }>;
+}
+
 export interface StoreSkuInfo {
+  storePrice?: number;
   skuId: string | number;
   /** 门店库存(取不到为 undefined) */
   stock?: number;

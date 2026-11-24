@@ -109,7 +109,7 @@ export function reportProgress(event: ProgressEvent) {
 
 /** ---------- 任务执行(消息处理器与页面注入按钮共用) ---------- */
 
-let cancelFlag = { cancelled: false };
+let cancelFlag: { cancelled: boolean; controller?: AbortController } = { cancelled: false };
 
 export function startExport(args: {
   sourceShopId: string | number;
@@ -128,7 +128,7 @@ export function startExport(args: {
   targetDir: FileSystemDirectoryHandle;
 }) {
   cancelFlag = { cancelled: false };
-  runExport({
+  return runExport({
     sourceShopId: args.sourceShopId,
     sourceShopName: args.sourceShopName,
     limitCount: args.limitCount,
@@ -150,9 +150,11 @@ export function startExport(args: {
 
 export function cancelCurrent() {
   cancelFlag.cancelled = true;
+  cancelFlag.controller?.abort();
 }
 
 export function startImport(args: {
+  store?: import('@shared/messaging').StoreImportOptions;
   /** 用户选定的导入源目录 */
   sourceDir: FileSystemDirectoryHandle;
   mapping: import('@shared/types').CategoryMapping;
@@ -167,8 +169,9 @@ export function startImport(args: {
   /** 手动模式必填:UI 层弹确认框,返回用户决定 */
   requestConfirm?: import('./import').RequestConfirm;
 }) {
-  cancelFlag = { cancelled: false };
-  runImport({
+  cancelFlag = { cancelled: false, controller: new AbortController() };
+  return runImport({
+    store: args.store,
     sourceDir: args.sourceDir,
     mapping: args.mapping,
     mode: args.mode ?? 'full',
@@ -196,7 +199,7 @@ export function startSync(args: {
   sourceDir: FileSystemDirectoryHandle;
 }) {
   cancelFlag = { cancelled: false };
-  runSync({
+  return runSync({
     shopId: args.shopId,
     shopName: args.shopName,
     syncStock: args.syncStock,
@@ -237,11 +240,8 @@ chrome.runtime.onMessage.addListener((msg: PopupRequest, _sender, sendResponse) 
         case 'IMPORT_START':
           // 这两个动作都需要 showDirectoryPicker 的用户手势,popup 触发的链路里
           // 没有有效手势,所以一律回退:在页面里打开对应的入口,把动作转交过去。
-          sendResponse({
-            ok: false,
-            error: '请到牵牛花后台页面点击「📦 导出本店商品」/「📥 导入商品」按钮',
-          } satisfies PopupResponse);
           openInPageEntry(msg.type === 'EXPORT_START' ? 'export' : 'import');
+          sendResponse({ ok: true, data: 'opened' } satisfies PopupResponse);
           return;
 
         case 'EXPORT_CANCEL':

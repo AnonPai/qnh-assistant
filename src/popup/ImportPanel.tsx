@@ -43,6 +43,7 @@ export function ImportPanel() {
     setSummary(null);
     const r = await sendToActiveTab({ type: 'IMPORT_START' });
     if (!r.ok) setError(r.error);
+    else window.close();
   };
 
   const cancel = async () => {
@@ -52,13 +53,12 @@ export function ImportPanel() {
   return (
     <div>
       <div className="muted" style={{ marginBottom: 8, fontSize: 12, lineHeight: 1.6 }}>
-        导入已改为「直接读取用户选定的目录」,不再使用 zip 包。请在牵牛花后台页面点击工具栏的
-        <strong>「📥 导入商品」</strong>按钮,选择之前导出的目录。
+        在页面的项目列表中选择已完成导出的项目，再选择导入模式。
       </div>
 
       <div className="row">
         <button className="btn primary" onClick={openInPage}>
-          在页面打开导入入口
+          打开导入配置
         </button>
         {running && (
           <button className="btn danger" onClick={cancel}>
@@ -73,7 +73,7 @@ export function ImportPanel() {
 
       {summary && (
         <div className="summary">
-          ✓ 导入完成 · 共 {summary.total} · 新建{' '}
+          {summary.cancelled ? '导入已取消' : summary.failed ? '导入完成（有失败）' : '✓ 导入完成'} · 共 {summary.total} · 新建{' '}
           <span className="success">{summary.succeeded}</span>
           {summary.updated > 0 && (
             <>

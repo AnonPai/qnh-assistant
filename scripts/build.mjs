@@ -56,6 +56,7 @@ async function buildScripts() {
     target: ['chrome120'],
     platform: 'browser',
     format: 'iife',
+    loader: { '.css': 'text' },
     sourcemap: isDev ? 'inline' : false,
     minify: !isDev,
     logLevel: 'info',

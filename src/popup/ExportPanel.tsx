@@ -41,13 +41,12 @@ export function ExportPanel() {
 
   const openInPage = async () => {
     setError(null);
-    // sendToActiveTab 会回 ok:false + 引导文案,这正是我们想要的:让 content
-    // 立刻在页面里把"选门店 → 选目录"流程拉起来。
     const r = await sendToActiveTab({
       type: 'EXPORT_START',
       payload: { sourceShopId: '' },
     });
     if (!r.ok) setError(r.error);
+    else window.close();
   };
 
   const cancel = async () => {
@@ -57,13 +56,12 @@ export function ExportPanel() {
   return (
     <div>
       <div className="muted" style={{ marginBottom: 8, fontSize: 12, lineHeight: 1.6 }}>
-        导出已改为「直接写入用户选定的目录」,不再生成 zip。请在牵牛花后台页面点击工具栏左侧的
-        <strong>「📦 导出本店商品」</strong>按钮,会依次让你选择门店、选项与本地目录。
+        在页面中选择来源门店，再从项目列表选择或新建导出项目。
       </div>
 
       <div className="row">
         <button className="btn primary" onClick={openInPage}>
-          在页面打开导出入口
+          打开导出配置
         </button>
         {running && (
           <button className="btn danger" onClick={cancel}>

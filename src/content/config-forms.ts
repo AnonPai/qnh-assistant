@@ -1,1079 +1,329 @@
-/**
- * 单页配置表单(导出 / 导入各一张)
- *
- * 替换原先的"门店选择 → 选项 → 目录 → 确认/三选 → 文件"逐步引导式弹窗,
- * 把所有可选项一次性铺在一张表上,用户按需填完之后点一次"开始"就跑。
- *
- * 设计要点:
- *   - Shadow DOM 隔离样式,避免被宿主页样式干扰(也不影响宿主页)。
- *   - 选目录 / 选映射文件按钮原地触发系统选择器(用户手势必须保留),
- *     选好之后只把"已选目录名 / 文件名"回显在表单上。
- *   - 目录选好之后立刻探测内容状态并就地展示(已完成 / 未完成 / 全新),
- *     不再用三选弹窗;若是未完成,提供「继续上次 / 重新开始」单选,
- *     全新与已完成则只有"开始"一种行为(已完成会显示"将覆盖"提示)。
- *   - 用户取消整张表单 = 关闭对话框,不发起任何操作。
- */
-
-import { createLogger } from '@shared/logger';
 import type { ShopBrief } from '@shared/messaging';
-import { detectExportTargetStatus, type ExportTargetStatus } from './export';
-import {
-  pickDirectory,
-  readManifestIfComplete,
-} from './fs-stage';
+import { bindDirectory, directoryMarkup } from './directory-field';
+import { detectExportTargetStatus, exportFilterKey, type ExportTargetStatus } from './export';
+import { readManifestIfComplete } from './fs-stage';
 import type { CallInjected } from './index';
-
-const log = createLogger('inpage-form');
-
-/* ============================================================
-   公共原语
-   ============================================================ */
-
-const DIALOG_HOST_STYLE =
-  'all:initial;position:fixed;top:0;left:0;width:0;height:0;z-index:2147483647;';
-
-/** 共享对话框样式;两张表单复用一份 CSS,变量化几个尺寸 */
-const FORM_CSS = `
-  :host { all: initial; }
-  .qnh-fm-mask {
-    position: fixed; inset: 0;
-    background: rgba(0,0,0,0.36);
-    display: flex; align-items: center; justify-content: center;
-    font: 13px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI",
-      "PingFang SC", "Microsoft YaHei", sans-serif;
-    color: #1f1f1f;
-  }
-  .qnh-fm-card {
-    width: 560px; max-height: 86vh;
-    background: #fff;
-    border-radius: 8px;
-    box-shadow: 0 12px 32px rgba(0,0,0,0.18);
-    display: flex; flex-direction: column; overflow: hidden;
-  }
-  .qnh-fm-head {
-    display: flex; align-items: center; justify-content: space-between;
-    padding: 12px 16px;
-    border-bottom: 1px solid #f0f1f2;
-  }
-  .qnh-fm-title { font-weight: 600; font-size: 14px; }
-  .qnh-fm-close {
-    all: unset; cursor: pointer; padding: 0 6px;
-    color: #999; font-size: 18px; line-height: 1;
-  }
-  .qnh-fm-close:hover { color: #1f1f1f; }
-  .qnh-fm-body {
-    padding: 12px 16px 4px;
-    overflow-y: auto;
-  }
-  .qnh-fm-section {
-    margin-bottom: 14px;
-  }
-  .qnh-fm-section:last-child { margin-bottom: 8px; }
-  .qnh-fm-section__label {
-    display: block;
-    font-size: 12px; color: #555;
-    margin-bottom: 6px;
-    font-weight: 500;
-  }
-  .qnh-fm-section__hint {
-    margin-top: 4px;
-    color: #888; font-size: 11px;
-    line-height: 1.5;
-  }
-  .qnh-fm-row {
-    display: flex; align-items: center; gap: 8px;
-  }
-  .qnh-fm-input {
-    flex: 1; min-width: 0;
-    padding: 6px 8px;
-    border: 1px solid #d9d9d9; border-radius: 4px;
-    font-size: 13px; outline: none; background: #fff;
-  }
-  .qnh-fm-input:focus { border-color: #1677ff; }
-  .qnh-fm-input[readonly] { background: #fafafa; color: #333; }
-  .qnh-fm-select {
-    width: 100%;
-    border: 1px solid #d9d9d9; border-radius: 4px;
-    font-size: 13px; padding: 2px;
-    outline: none;
-  }
-  .qnh-fm-select:focus { border-color: #1677ff; }
-  .qnh-fm-choices {
-    display: flex; flex-direction: column; gap: 6px;
-  }
-  .qnh-fm-radio, .qnh-fm-check {
-    display: flex; align-items: center; gap: 6px;
-    font-size: 13px; cursor: pointer;
-  }
-  .qnh-fm-radio input, .qnh-fm-check input { margin: 0; }
-  .qnh-fm-radio__hint, .qnh-fm-check__hint {
-    color: #888; font-size: 11px;
-  }
-  .qnh-fm-pill {
-    display: inline-flex; align-items: center;
-    padding: 2px 8px; border-radius: 10px;
-    font-size: 11px; line-height: 1.6;
-    margin-left: 6px;
-  }
-  .qnh-fm-pill--info  { background: #e6f4ff; color: #0958d9; }
-  .qnh-fm-pill--ok    { background: #f6ffed; color: #389e0d; }
-  .qnh-fm-pill--warn  { background: #fff7e6; color: #d48806; }
-  .qnh-fm-pill--err   { background: #fff1f0; color: #cf1322; }
-  .qnh-fm-btn {
-    all: unset; cursor: pointer;
-    padding: 5px 12px; border-radius: 4px;
-    font-size: 12px; border: 1px solid #d9d9d9;
-    background: #fff;
-  }
-  .qnh-fm-btn:hover { background: #fafafa; }
-  .qnh-fm-btn[disabled] { opacity: 0.5; cursor: not-allowed; }
-  .qnh-fm-foot {
-    display: flex; align-items: center; justify-content: flex-end;
-    gap: 10px;
-    padding: 10px 16px;
-    border-top: 1px solid #f0f1f2;
-    background: #fafbff;
-  }
-  .qnh-fm-foot__hint {
-    margin-right: auto; color: #888; font-size: 11px;
-  }
-  .qnh-fm-foot__hint.err { color: #cf1322; }
-  .qnh-fm-action {
-    all: unset; cursor: pointer;
-    padding: 6px 16px; border-radius: 4px;
-    font-size: 13px; border: 1px solid #d9d9d9;
-  }
-  .qnh-fm-action:hover { background: #fafafa; }
-  .qnh-fm-action.primary {
-    background: #1677ff; color: #fff; border-color: #1677ff;
-  }
-  .qnh-fm-action.primary:hover { background: #4096ff; }
-  .qnh-fm-action[disabled] { opacity: 0.5; cursor: not-allowed; }
-  .qnh-fm-status {
-    margin-top: 6px;
-    padding: 8px 10px;
-    background: #fafbfc;
-    border: 1px solid #eef0f2;
-    border-radius: 4px;
-    font-size: 12px;
-    line-height: 1.6;
-    color: #555;
-  }
-  .qnh-fm-status.warn { background: #fffbe6; border-color: #ffe58f; color: #ad6800; }
-  .qnh-fm-status.err  { background: #fff1f0; border-color: #ffccc7; color: #cf1322; }
-  .qnh-fm-search {
-    width: 100%; padding: 5px 8px;
-    border: 1px solid #d9d9d9; border-radius: 4px;
-    font-size: 12px; outline: none; margin-bottom: 6px;
-  }
-  .qnh-fm-search:focus { border-color: #1677ff; }
-`;
-
-function escapeHtml(s: string): string {
-  return String(s).replace(/[&<>"']/g, (c) => {
-    return ({
-      '&': '&amp;',
-      '<': '&lt;',
-      '>': '&gt;',
-      '"': '&quot;',
-      "'": '&#39;',
-    } as Record<string, string>)[c]!;
-  });
-}
-
-/**
- * 把用户输入的"多 ID 文本"拆成去重后的字符串数组。
- * 支持逗号(中英文)、空格、换行、顿号、分号作为分隔符。空输入返回 null。
- */
-function parseIdList(raw: string): string[] | null {
-  const parts = (raw ?? '')
-    .split(/[\s,,、;;]+/)
-    .map((x) => x.trim())
-    .filter(Boolean);
-  if (parts.length === 0) return null;
-  return Array.from(new Set(parts));
-}
-
-function buildShadowHost(html: string): { host: HTMLDivElement; root: ShadowRoot } {
-  const host = document.createElement('div');
-  host.style.cssText = DIALOG_HOST_STYLE;
-  document.documentElement.appendChild(host);
-  const root = host.attachShadow({ mode: 'open' });
-  root.innerHTML = html;
-  return { host, root };
-}
-
-/* ============================================================
-   导出表单
-   ============================================================ */
+import styles from './config-forms.css?inline';
 
 export interface ExportFormResult {
   shop: ShopBrief;
   spuNameKeyword: string | null;
-  /** 精确指定要导出的 SPU id 清单;非空时跳过分页直接按清单导出 */
-  spuIdAllowlist: Array<string | number> | null;
-  /** SKU 维度的条码(UPC)筛选;只导出任一 SKU 命中的商品 */
-  skuUpcList: string[] | null;
-  /** SKU id 筛选;只导出任一 SKU 命中给定 skuId 的商品 */
+  spuIdAllowlist: string[] | null;
   skuIdList: string[] | null;
-  /** 是否一并下载图片(默认 true) */
+  skuUpcList: string[] | null;
   includeImages: boolean;
   includeVideo: boolean;
-  /** 用户已经在表单内通过 showDirectoryPicker 拿到的目录 handle */
   targetDir: FileSystemDirectoryHandle;
-  /** 由表单基于目录状态推导出的"启动姿态" */
   startMode: 'fresh' | 'overwrite' | 'resume';
 }
 
 export interface OpenExportFormArgs {
-  /** 拉门店列表 */
   callInjected: CallInjected;
-  /** 表单出现时,如果页面"商品名称"筛选框有值,可由调用方预填 */
   initialSpuNameKeyword?: string;
-  /** 预填 "SPU ID 筛选"(从页面筛选区读到的值) */
   initialSpuIds?: string;
-  /** 预填 "SKU ID 筛选"(从页面筛选区读到的值) */
   initialSkuIds?: string;
-  /** 预填 "商品条码筛选"(从页面筛选区读到的值) */
   initialSkuUpcs?: string;
 }
 
-/**
- * 弹出导出配置表单。返回 Promise 在用户点"开始导出"时 resolve,
- * 关闭/取消时 resolve(null)。
- */
-export function openExportForm(args: OpenExportFormArgs): Promise<ExportFormResult | null> {
-  return new Promise((resolve) => {
-    const { host, root } = buildShadowHost(`
-      <style>${FORM_CSS}</style>
-      <div class="qnh-fm-mask">
-        <div class="qnh-fm-card" role="dialog" aria-modal="true">
-          <div class="qnh-fm-head">
-            <span class="qnh-fm-title">导出本店商品</span>
-            <button class="qnh-fm-close" data-act="cancel" title="关闭">×</button>
-          </div>
-          <div class="qnh-fm-body">
-
-            <div class="qnh-fm-section">
-              <span class="qnh-fm-section__label">门店</span>
-              <input class="qnh-fm-search" data-id="shop-search" placeholder="搜索门店名 / 编号 / 城市" />
-              <select class="qnh-fm-select" data-id="shop-select" size="6"></select>
-              <div class="qnh-fm-section__hint" data-id="shop-hint">加载门店列表中…</div>
-            </div>
-
-            <div class="qnh-fm-section">
-              <span class="qnh-fm-section__label">商品名筛选(可选)</span>
-              <input class="qnh-fm-input" data-id="spu-name" placeholder="留空则全店导出" />
-              <div class="qnh-fm-section__hint">仅导出名称包含此关键字的商品。</div>
-            </div>
-
-            <div class="qnh-fm-section">
-              <span class="qnh-fm-section__label">SPU ID 筛选(可选)</span>
-              <input class="qnh-fm-input" data-id="spu-ids" placeholder="多个用逗号 / 空格 / 换行分隔" />
-              <div class="qnh-fm-section__hint">
-                填了 SPU ID 就只导出这些商品,跳过整店分页(最精确最快)。会忽略其它筛选条件。
-              </div>
-            </div>
-
-            <div class="qnh-fm-section">
-              <span class="qnh-fm-section__label">SKU ID 筛选(可选)</span>
-              <input class="qnh-fm-input" data-id="sku-ids" placeholder="SKU ID,多个用逗号 / 空格 / 换行分隔" />
-              <div class="qnh-fm-section__hint">仅导出"任一 SKU 命中给定 SKU ID"的商品。可与"商品名 / 条码"叠加。</div>
-            </div>
-
-            <div class="qnh-fm-section">
-              <span class="qnh-fm-section__label">商品条码筛选(可选)</span>
-              <input class="qnh-fm-input" data-id="sku-upcs" placeholder="商品条码 / UPC,多个用逗号 / 空格 / 换行分隔" />
-              <div class="qnh-fm-section__hint">仅导出"任一条码命中"的商品(按 SKU 的 UPC 比对)。可与"商品名"叠加。</div>
-            </div>
-
-            <div class="qnh-fm-section">
-              <span class="qnh-fm-section__label">导出选项</span>
-              <label class="qnh-fm-check">
-                <input type="checkbox" data-id="include-images" checked />
-                <span>下载图片到本地</span>
-                <span class="qnh-fm-check__hint">(取消后图片字段保留原始 CDN URL,导入时按直链同步)</span>
-              </label>
-              <label class="qnh-fm-check" style="margin-top:6px;">
-                <input type="checkbox" data-id="include-video" />
-                <span>同时下载视频</span>
-                <span class="qnh-fm-check__hint">(默认不下,体积大且导入端暂不支持自动上传)</span>
-              </label>
-            </div>
-
-            <div class="qnh-fm-section">
-              <span class="qnh-fm-section__label">导出目录</span>
-              <div class="qnh-fm-row">
-                <input class="qnh-fm-input" data-id="dir-name" readonly placeholder="尚未选择目录" />
-                <button class="qnh-fm-btn" data-act="pick-dir">选择目录…</button>
-              </div>
-              <div class="qnh-fm-status" data-id="dir-status" style="display:none"></div>
-            </div>
-
-          </div>
-          <div class="qnh-fm-foot">
-            <span class="qnh-fm-foot__hint" data-id="foot-hint">填好"门店"和"导出目录"后开始</span>
-            <button class="qnh-fm-action" data-act="cancel">取消</button>
-            <button class="qnh-fm-action primary" data-act="ok" disabled>开始导出</button>
-          </div>
-        </div>
-      </div>
-    `);
-
-    /* ---- DOM 引用 ---- */
-    const $ = <T extends HTMLElement = HTMLElement>(sel: string) =>
-      root.querySelector(sel) as T | null;
-    const shopSearch = $<HTMLInputElement>('[data-id="shop-search"]')!;
-    const shopSelect = $<HTMLSelectElement>('[data-id="shop-select"]')!;
-    const shopHint = $('[data-id="shop-hint"]')!;
-    const spuName = $<HTMLInputElement>('[data-id="spu-name"]')!;
-    const spuIds = $<HTMLInputElement>('[data-id="spu-ids"]')!;
-    const skuIds = $<HTMLInputElement>('[data-id="sku-ids"]')!;
-    const skuUpcs = $<HTMLInputElement>('[data-id="sku-upcs"]')!;
-    const includeImages = $<HTMLInputElement>('[data-id="include-images"]')!;
-    const includeVideo = $<HTMLInputElement>('[data-id="include-video"]')!;
-    const dirName = $<HTMLInputElement>('[data-id="dir-name"]')!;
-    const dirStatus = $('[data-id="dir-status"]')!;
-    const footHint = $('[data-id="foot-hint"]')!;
-    const okBtn = $<HTMLButtonElement>('[data-act="ok"]')!;
-
-    /* ---- 状态 ---- */
-    let shops: ShopBrief[] = [];
-    let selectedShop: ShopBrief | null = null;
-    let dirHandle: FileSystemDirectoryHandle | null = null;
-    let dirState: ExportTargetStatus | null = null;
-    let resumeChoice: 'continue' | 'restart' = 'continue';
-
-    if (args.initialSpuNameKeyword) {
-      spuName.value = args.initialSpuNameKeyword;
-    }
-    if (args.initialSpuIds) {
-      spuIds.value = args.initialSpuIds;
-    }
-    if (args.initialSkuIds) {
-      skuIds.value = args.initialSkuIds;
-    }
-    if (args.initialSkuUpcs) {
-      skuUpcs.value = args.initialSkuUpcs;
-    }
-
-    /* ---- 关闭 ---- */
-    const dispose = (result: ExportFormResult | null) => {
-      host.remove();
-      resolve(result);
-    };
-
-    root.addEventListener('click', (e) => {
-      const target = e.target as HTMLElement;
-      const act = target.closest<HTMLElement>('[data-act]')?.dataset.act;
-      if (act === 'cancel') dispose(null);
-    });
-    root.querySelector('.qnh-fm-mask')?.addEventListener('click', (e) => {
-      if ((e.target as HTMLElement).classList.contains('qnh-fm-mask')) dispose(null);
-    });
-
-    /* ---- 拉门店列表 ---- */
-    args.callInjected<ShopBrief[]>({ type: 'FETCH_SHOP_LIST' })
-      .then((list) => {
-        shops = Array.isArray(list) ? list : [];
-        shopHint.textContent = shops.length === 0
-          ? '当前账号下没有可管理的门店'
-          : `共 ${shops.length} 家门店`;
-        renderShopList();
-      })
-      .catch((err: Error) => {
-        shopHint.textContent = `加载失败:${err.message}`;
-        shopHint.classList.add('err');
-        log.warn('门店列表加载失败', err);
-      });
-
-    function filterShops(): ShopBrief[] {
-      const k = shopSearch.value.trim();
-      if (!k) return shops;
-      // 多 ID 搜索:逗号 / 顿号分隔
-      if (/[,,、]/.test(k)) {
-        const ids = k.split(/[,,、]/).map((x) => x.trim()).filter(Boolean);
-        return shops.filter((s) => ids.some((q) => String(s.shopId).includes(q)));
-      }
-      const lower = k.toLowerCase();
-      return shops.filter(
-        (s) =>
-          String(s.shopId).toLowerCase().includes(lower) ||
-          (s.shopName ?? '').toLowerCase().includes(lower) ||
-          (s.region ?? '').toLowerCase().includes(lower),
-      );
-    }
-
-    function renderShopList() {
-      const list = filterShops();
-      shopSelect.innerHTML = list
-        .map((s) => {
-          const sel = selectedShop && String(selectedShop.shopId) === String(s.shopId);
-          const region = s.region ? ` · ${escapeHtml(s.region)}` : '';
-          return `<option value="${escapeHtml(String(s.shopId))}" ${sel ? 'selected' : ''}>${escapeHtml(s.shopName ?? '(未命名)')}${region} · #${escapeHtml(String(s.shopId))}</option>`;
-        })
-        .join('');
-      shopSelect.size = Math.min(8, Math.max(3, list.length));
-      if (list.length === 0) {
-        shopSelect.innerHTML = '<option disabled>没有匹配门店</option>';
-      }
-      updateFoot();
-    }
-
-    shopSearch.addEventListener('input', () => renderShopList());
-    shopSelect.addEventListener('change', () => {
-      const v = shopSelect.value;
-      selectedShop = shops.find((s) => String(s.shopId) === v) ?? null;
-      updateFoot();
-    });
-
-    /* ---- 选目录 ---- */
-    root.querySelector('[data-act="pick-dir"]')?.addEventListener('click', async () => {
-      try {
-        const dir = await pickDirectory({ id: 'qnh-export-dir', mode: 'readwrite' });
-        dirHandle = dir;
-        dirName.value = dir.name;
-        dirStatus.style.display = 'none';
-        dirStatus.classList.remove('warn', 'err');
-        dirStatus.textContent = '检查目录状态…';
-        dirStatus.style.display = '';
-        try {
-          dirState = await detectExportTargetStatus(dir);
-          renderDirStatus();
-        } catch (e) {
-          dirState = null;
-          dirStatus.classList.add('err');
-          dirStatus.textContent = `读取目录失败:${(e as Error).message}`;
-        }
-        updateFoot();
-      } catch (e) {
-        if ((e as DOMException)?.name === 'AbortError') return;
-        dirStatus.style.display = '';
-        dirStatus.classList.add('err');
-        dirStatus.textContent = `选择目录失败:${(e as Error).message}`;
-      }
-    });
-
-    function renderDirStatus() {
-      dirStatus.classList.remove('warn', 'err');
-      if (!dirState) {
-        dirStatus.style.display = 'none';
-        return;
-      }
-      dirStatus.style.display = '';
-      if (dirState.kind === 'empty') {
-        dirStatus.textContent = '目录为空 / 尚无导出 — 将作为新任务写入。';
-        return;
-      }
-      if (dirState.kind === 'complete') {
-        dirStatus.classList.add('warn');
-        const m = dirState.manifest;
-        dirStatus.textContent =
-          `目录里已有完整导出(${m.source.shopName ?? '?'} · ${m.productCount} 个商品)。` +
-          ` 继续将覆盖此目录里的内容。`;
-        return;
-      }
-      // incomplete
-      const p = dirState.progress;
-      const sameShop = !!selectedShop && String(p.source.shopId) === String(selectedShop.shopId);
-      const sameOpts =
-        p.options.includeVideo === includeVideo.checked &&
-        (p.options.includeImages ?? true) === includeImages.checked;
-      if (sameShop && sameOpts) {
-        // 提供"继续 / 重来"两个 radio
-        dirStatus.classList.add('warn');
-        dirStatus.innerHTML = `
-          <div>上次导出未完成:已完成 ${p.doneSpuIds.length} 个 SPU,队列还有 ${p.queue.length} 个。</div>
-          <div class="qnh-fm-choices" style="margin-top:6px;">
-            <label class="qnh-fm-radio">
-              <input type="radio" name="qnh-resume" value="continue" ${resumeChoice === 'continue' ? 'checked' : ''} />
-              <span>继续上次</span>
-            </label>
-            <label class="qnh-fm-radio">
-              <input type="radio" name="qnh-resume" value="restart" ${resumeChoice === 'restart' ? 'checked' : ''} />
-              <span>重新开始(丢弃旧进度)</span>
-            </label>
-          </div>
-        `;
-        dirStatus.querySelectorAll<HTMLInputElement>('input[name="qnh-resume"]').forEach((el) => {
-          el.addEventListener('change', () => {
-            if (el.checked) resumeChoice = (el.value as 'continue' | 'restart');
-            updateFoot();
-          });
-        });
-      } else {
-        dirStatus.classList.add('warn');
-        dirStatus.textContent =
-          `目录里有未完成的导出(原:${p.source.shopName ?? '?'},选项与当前不一致)。` +
-          ` 继续将丢弃旧进度,重新开始。`;
-      }
-    }
-
-    /* 用户改了门店或视频选项 → 重新渲染目录状态(影响 sameShop / sameOpts 判断) */
-    shopSelect.addEventListener('change', () => renderDirStatus());
-    includeVideo.addEventListener('change', () => renderDirStatus());
-    includeImages.addEventListener('change', () => renderDirStatus());
-
-    /* ---- 表单状态汇总 ---- */
-    function updateFoot() {
-      const ready = !!selectedShop && !!dirHandle;
-      okBtn.disabled = !ready;
-      footHint.classList.remove('err');
-      if (!selectedShop) {
-        footHint.textContent = '请选择门店';
-      } else if (!dirHandle) {
-        footHint.textContent = '请选择导出目录';
-      } else if (
-        dirState?.kind === 'incomplete' &&
-        selectedShop &&
-        String(dirState.progress.source.shopId) === String(selectedShop.shopId) &&
-        dirState.progress.options.includeVideo === includeVideo.checked &&
-        (dirState.progress.options.includeImages ?? true) === includeImages.checked
-      ) {
-        footHint.textContent = resumeChoice === 'continue' ? '将继续上次导出' : '将丢弃旧进度并重新开始';
-      } else if (dirState?.kind === 'complete') {
-        footHint.textContent = '将覆盖目录中已有的导出';
-      } else {
-        footHint.textContent = '准备就绪';
-      }
-    }
-
-    /* ---- 提交 ---- */
-    root.querySelector('[data-act="ok"]')?.addEventListener('click', () => {
-      if (!selectedShop || !dirHandle) return;
-      let startMode: ExportFormResult['startMode'];
-      if (dirState?.kind === 'complete') {
-        startMode = 'overwrite';
-      } else if (
-        dirState?.kind === 'incomplete' &&
-        String(dirState.progress.source.shopId) === String(selectedShop.shopId) &&
-        dirState.progress.options.includeVideo === includeVideo.checked &&
-        (dirState.progress.options.includeImages ?? true) === includeImages.checked
-      ) {
-        startMode = resumeChoice === 'continue' ? 'resume' : 'overwrite';
-      } else if (dirState?.kind === 'incomplete') {
-        // 选项不一致 — 等价于覆盖
-        startMode = 'overwrite';
-      } else {
-        startMode = 'fresh';
-      }
-      dispose({
-        shop: selectedShop,
-        spuNameKeyword: spuName.value.trim() || null,
-        spuIdAllowlist: parseIdList(spuIds.value),
-        skuIdList: parseIdList(skuIds.value),
-        skuUpcList: parseIdList(skuUpcs.value),
-        includeImages: includeImages.checked,
-        includeVideo: includeVideo.checked,
-        targetDir: dirHandle,
-        startMode,
-      });
-    });
-
-    /* 默认聚焦搜索框 */
-    setTimeout(() => shopSearch.focus(), 0);
-  });
-}
-
-/* ============================================================
-   同步库存 / 零售价表单
-   ============================================================ */
-
-export interface SyncFormResult {
-  shop: ShopBrief;
-  /** 是否同步库存(默认 true) */
-  syncStock: boolean;
-  /** 是否同步零售价(默认 true) */
-  syncPrice: boolean;
-  /** 数据源目录(导出产物);用户在表单内通过 showDirectoryPicker 拿到 */
-  sourceDir: FileSystemDirectoryHandle;
-}
-
-export interface OpenSyncFormArgs {
-  /** 拉门店列表 */
-  callInjected: CallInjected;
-}
-
-/**
- * 弹出「同步库存 / 零售价」配置表单。
- * 用户选择目标门店 + 勾选要同步的项(库存 / 零售价,默认都勾)+ 选择数据源目录(导出产物),
- * 点"开始同步"时 resolve;关闭/取消 resolve(null)。
- */
-export function openSyncForm(args: OpenSyncFormArgs): Promise<SyncFormResult | null> {
-  return new Promise((resolve) => {
-    const { host, root } = buildShadowHost(`
-      <style>${FORM_CSS}</style>
-      <div class="qnh-fm-mask">
-        <div class="qnh-fm-card" role="dialog" aria-modal="true">
-          <div class="qnh-fm-head">
-            <span class="qnh-fm-title">同步库存 / 零售价</span>
-            <button class="qnh-fm-close" data-act="cancel" title="关闭">×</button>
-          </div>
-          <div class="qnh-fm-body">
-
-            <div class="qnh-fm-section">
-              <span class="qnh-fm-section__label">目标门店</span>
-              <input class="qnh-fm-search" data-id="shop-search" placeholder="搜索门店名 / 编号 / 城市" />
-              <select class="qnh-fm-select" data-id="shop-select" size="6"></select>
-              <div class="qnh-fm-section__hint" data-id="shop-hint">加载门店列表中…</div>
-            </div>
-
-            <div class="qnh-fm-section">
-              <span class="qnh-fm-section__label">同步项</span>
-              <label class="qnh-fm-check">
-                <input type="checkbox" data-id="sync-stock" checked />
-                <span>同步库存</span>
-                <span class="qnh-fm-check__hint">(按数据源里每个 SKU 的库存绝对值覆盖目标门店)</span>
-              </label>
-              <label class="qnh-fm-check" style="margin-top:6px;">
-                <input type="checkbox" data-id="sync-price" checked />
-                <span>同步零售价</span>
-                <span class="qnh-fm-check__hint">(固定价同时下发到美团闪购 / 饿了么渠道)</span>
-              </label>
-            </div>
-
-            <div class="qnh-fm-section">
-              <span class="qnh-fm-section__label">数据源目录</span>
-              <div class="qnh-fm-row">
-                <input class="qnh-fm-input" data-id="dir-name" readonly placeholder="尚未选择目录" />
-                <button class="qnh-fm-btn" data-act="pick-dir">选择目录…</button>
-              </div>
-              <div class="qnh-fm-status" data-id="dir-status" style="display:none"></div>
-              <div class="qnh-fm-section__hint">
-                选择一份导出目录;同一租户下 SKU 通用,导出包里记录的价格 / 库存会推到上面选定的门店。
-              </div>
-            </div>
-
-          </div>
-          <div class="qnh-fm-foot">
-            <span class="qnh-fm-foot__hint" data-id="foot-hint">选好"门店"和"数据源目录"后开始</span>
-            <button class="qnh-fm-action" data-act="cancel">取消</button>
-            <button class="qnh-fm-action primary" data-act="ok" disabled>开始同步</button>
-          </div>
-        </div>
-      </div>
-    `);
-
-    const $ = <T extends HTMLElement = HTMLElement>(sel: string) =>
-      root.querySelector(sel) as T | null;
-    const shopSearch = $<HTMLInputElement>('[data-id="shop-search"]')!;
-    const shopSelect = $<HTMLSelectElement>('[data-id="shop-select"]')!;
-    const shopHint = $('[data-id="shop-hint"]')!;
-    const syncStock = $<HTMLInputElement>('[data-id="sync-stock"]')!;
-    const syncPrice = $<HTMLInputElement>('[data-id="sync-price"]')!;
-    const dirName = $<HTMLInputElement>('[data-id="dir-name"]')!;
-    const dirStatus = $('[data-id="dir-status"]')!;
-    const footHint = $('[data-id="foot-hint"]')!;
-    const okBtn = $<HTMLButtonElement>('[data-act="ok"]')!;
-
-    let shops: ShopBrief[] = [];
-    let selectedShop: ShopBrief | null = null;
-    let dirHandle: FileSystemDirectoryHandle | null = null;
-    let dirOk = false;
-
-    const dispose = (result: SyncFormResult | null) => {
-      host.remove();
-      resolve(result);
-    };
-
-    root.addEventListener('click', (e) => {
-      const target = e.target as HTMLElement;
-      const act = target.closest<HTMLElement>('[data-act]')?.dataset.act;
-      if (act === 'cancel') dispose(null);
-    });
-    root.querySelector('.qnh-fm-mask')?.addEventListener('click', (e) => {
-      if ((e.target as HTMLElement).classList.contains('qnh-fm-mask')) dispose(null);
-    });
-
-    /* ---- 拉门店列表 ---- */
-    args.callInjected<ShopBrief[]>({ type: 'FETCH_SHOP_LIST' })
-      .then((list) => {
-        shops = Array.isArray(list) ? list : [];
-        shopHint.textContent = shops.length === 0
-          ? '当前账号下没有可管理的门店'
-          : `共 ${shops.length} 家门店`;
-        renderShopList();
-      })
-      .catch((err: Error) => {
-        shopHint.textContent = `加载失败:${err.message}`;
-        shopHint.classList.add('err');
-        log.warn('门店列表加载失败', err);
-      });
-
-    function filterShops(): ShopBrief[] {
-      const k = shopSearch.value.trim();
-      if (!k) return shops;
-      if (/[,,、]/.test(k)) {
-        const ids = k.split(/[,,、]/).map((x) => x.trim()).filter(Boolean);
-        return shops.filter((s) => ids.some((q) => String(s.shopId).includes(q)));
-      }
-      const lower = k.toLowerCase();
-      return shops.filter(
-        (s) =>
-          String(s.shopId).toLowerCase().includes(lower) ||
-          (s.shopName ?? '').toLowerCase().includes(lower) ||
-          (s.region ?? '').toLowerCase().includes(lower),
-      );
-    }
-
-    function renderShopList() {
-      const list = filterShops();
-      shopSelect.innerHTML = list
-        .map((s) => {
-          const sel = selectedShop && String(selectedShop.shopId) === String(s.shopId);
-          const region = s.region ? ` · ${escapeHtml(s.region)}` : '';
-          return `<option value="${escapeHtml(String(s.shopId))}" ${sel ? 'selected' : ''}>${escapeHtml(s.shopName ?? '(未命名)')}${region} · #${escapeHtml(String(s.shopId))}</option>`;
-        })
-        .join('');
-      shopSelect.size = Math.min(8, Math.max(3, list.length));
-      if (list.length === 0) {
-        shopSelect.innerHTML = '<option disabled>没有匹配门店</option>';
-      }
-      updateFoot();
-    }
-
-    shopSearch.addEventListener('input', () => renderShopList());
-    shopSelect.addEventListener('change', () => {
-      selectedShop = shops.find((s) => String(s.shopId) === shopSelect.value) ?? null;
-      updateFoot();
-    });
-
-    /* ---- 选目录 ---- */
-    root.querySelector('[data-act="pick-dir"]')?.addEventListener('click', async () => {
-      try {
-        const dir = await pickDirectory({ id: 'qnh-sync-dir', mode: 'read' });
-        dirHandle = dir;
-        dirName.value = dir.name;
-        dirStatus.style.display = '';
-        dirStatus.classList.remove('warn', 'err');
-        dirStatus.textContent = '校验目录…';
-        const manifest = await readManifestIfComplete(dir);
-        if (!manifest) {
-          dirOk = false;
-          dirStatus.classList.add('err');
-          dirStatus.textContent =
-            '所选目录里找不到 manifest.json,可能不是导出目录或上次导出未完成。';
-        } else {
-          dirOk = true;
-          dirStatus.classList.remove('err');
-          const m = manifest as {
-            productCount?: number;
-            source?: { shopName?: string };
-          };
-          dirStatus.textContent =
-            `数据源就绪 · ${m.source?.shopName ?? '?'} · ${m.productCount ?? '?'} 个商品`;
-        }
-        updateFoot();
-      } catch (e) {
-        if ((e as DOMException)?.name === 'AbortError') return;
-        dirStatus.style.display = '';
-        dirStatus.classList.add('err');
-        dirStatus.textContent = `选择目录失败:${(e as Error).message}`;
-      }
-    });
-
-    /* ---- 表单状态 ---- */
-    function updateFoot() {
-      const anySync = syncStock.checked || syncPrice.checked;
-      okBtn.disabled = !(selectedShop && dirOk && anySync);
-      footHint.classList.remove('err');
-      if (!selectedShop) {
-        footHint.textContent = '请选择目标门店';
-      } else if (!dirHandle) {
-        footHint.textContent = '请选择数据源目录';
-      } else if (!dirOk) {
-        footHint.classList.add('err');
-        footHint.textContent = '所选目录不是有效的导出包';
-      } else if (!anySync) {
-        footHint.classList.add('err');
-        footHint.textContent = '至少勾选一项(库存 / 零售价)';
-      } else {
-        const parts: string[] = [];
-        if (syncStock.checked) parts.push('同步库存');
-        if (syncPrice.checked) parts.push('同步零售价');
-        footHint.textContent = `→ ${selectedShop.shopName ?? selectedShop.shopId} · ${parts.join(' · ')}`;
-      }
-    }
-    syncStock.addEventListener('change', updateFoot);
-    syncPrice.addEventListener('change', updateFoot);
-
-    /* ---- 提交 ---- */
-    root.querySelector('[data-act="ok"]')?.addEventListener('click', () => {
-      if (!selectedShop || !dirHandle || !dirOk) return;
-      if (!syncStock.checked && !syncPrice.checked) return;
-      dispose({
-        shop: selectedShop,
-        syncStock: syncStock.checked,
-        syncPrice: syncPrice.checked,
-        sourceDir: dirHandle,
-      });
-    });
-
-    setTimeout(() => shopSearch.focus(), 0);
-  });
-}
-
-/* ============================================================
-   导入表单
-   ============================================================ */
 export interface ImportFormResult {
+  shop?: ShopBrief;
+  purchaseUnitPrice?: number;
   sourceDir: FileSystemDirectoryHandle;
   mode: 'full' | 'incremental';
   confirmMode: 'auto' | 'manual';
-  /** 是否同步图片;false 时跳过所有图片上传 / 比对 */
   syncImages: boolean;
-  /** 名称一致但 UPC 不一致时是否走修改(默认 true) */
   updateOnNameMatch: boolean;
-  /** 用户附带的店内分类映射文件(可选) */
   frontCategoryMappingFile: File | null;
 }
 
-export interface OpenImportFormArgs {
-  /** 选完目录后用来检测是否是有效导出包 */
-  // 不传 callInjected 也可以,但保留以备后续扩展
+export interface SyncFormResult {
+  shop: ShopBrief;
+  syncStock: boolean;
+  syncPrice: boolean;
+  sourceDir: FileSystemDirectoryHandle;
 }
 
-/**
- * 弹出导入配置表单。返回 Promise 在用户点"开始导入"时 resolve,关闭/取消 resolve(null)。
- */
-export function openImportForm(_args: OpenImportFormArgs = {}): Promise<ImportFormResult | null> {
-  return new Promise((resolve) => {
-    const { host, root } = buildShadowHost(`
-      <style>${FORM_CSS}</style>
-      <div class="qnh-fm-mask">
-        <div class="qnh-fm-card" role="dialog" aria-modal="true">
-          <div class="qnh-fm-head">
-            <span class="qnh-fm-title">导入商品</span>
-            <button class="qnh-fm-close" data-act="cancel" title="关闭">×</button>
-          </div>
-          <div class="qnh-fm-body">
+function parseIds(text: string) {
+  const ids = text.split(/[\s,，、;；]+/).filter(Boolean);
+  return ids.length ? [...new Set(ids)] : null;
+}
 
-            <div class="qnh-fm-section">
-              <span class="qnh-fm-section__label">导入源目录</span>
-              <div class="qnh-fm-row">
-                <input class="qnh-fm-input" data-id="dir-name" readonly placeholder="尚未选择目录" />
-                <button class="qnh-fm-btn" data-act="pick-dir">选择目录…</button>
-              </div>
-              <div class="qnh-fm-status" data-id="dir-status" style="display:none"></div>
-            </div>
+function choice(id: string, title: string, hint: string, checked = false, group?: string) {
+  const type = group ? `type="radio" name="${group}"` : 'type="checkbox"';
+  return `<label class="choice"><input id="${id}" ${type} ${checked ? 'checked' : ''}>
+    <span>${title}</span><small>${hint}</small></label>`;
+}
 
-            <div class="qnh-fm-section">
-              <span class="qnh-fm-section__label">导入模式</span>
-              <div class="qnh-fm-choices">
-                <label class="qnh-fm-radio">
-                  <input type="radio" name="qnh-mode" value="full" checked />
-                  <span>全量导入</span>
-                  <span class="qnh-fm-radio__hint">UPC 命中走"修改"接口,参数一致则跳过</span>
-                </label>
-                <label class="qnh-fm-radio">
-                  <input type="radio" name="qnh-mode" value="incremental" />
-                  <span>增量导入</span>
-                  <span class="qnh-fm-radio__hint">已存在的按 UPC / 同名跳过</span>
-                </label>
-              </div>
-            </div>
+function section(title: string, body: string) {
+  return `<section><h3>${title}</h3><div class="choices">${body}</div></section>`;
+}
 
-            <div class="qnh-fm-section">
-              <span class="qnh-fm-section__label">执行方式</span>
-              <div class="qnh-fm-choices">
-                <label class="qnh-fm-radio">
-                  <input type="radio" name="qnh-confirm" value="auto" checked />
-                  <span>自动</span>
-                  <span class="qnh-fm-radio__hint">程序自动逐个执行</span>
-                </label>
-                <label class="qnh-fm-radio">
-                  <input type="radio" name="qnh-confirm" value="manual" />
-                  <span>手动</span>
-                  <span class="qnh-fm-radio__hint">每个商品写入前需点对号确认</span>
-                </label>
-              </div>
-            </div>
+function shopMarkup(title: string) {
+  return `<section><h3>${title}</h3><div class="shop-fields">
+    <input type="search" id="shop-search" aria-label="搜索门店" placeholder="搜索名称、编号或城市">
+    <select id="shop" aria-label="${title}"><option value="">请选择门店</option></select>
+    </div><p class="hint" id="shop-hint" role="status">正在加载门店…</p></section>`;
+}
 
-            <div class="qnh-fm-section">
-              <span class="qnh-fm-section__label">图片同步</span>
-              <label class="qnh-fm-check">
-                <input type="checkbox" data-id="sync-images" checked />
-                <span>同步图片到目标店</span>
-                <span class="qnh-fm-check__hint">取消后不会上传也不比对图片(更快,但目标店图片字段可能为空)</span>
-              </label>
-            </div>
+function bindShop(root: ShadowRoot, call: CallInjected, changed: () => void) {
+  const search = root.querySelector<HTMLInputElement>('#shop-search')!;
+  const select = root.querySelector<HTMLSelectElement>('#shop')!;
+  const hint = root.querySelector<HTMLElement>('#shop-hint')!;
+  let shops: ShopBrief[] = [];
 
-            <div class="qnh-fm-section">
-              <span class="qnh-fm-section__label">同名异 UPC 处理</span>
-              <label class="qnh-fm-check">
-                <input type="checkbox" data-id="update-on-name" checked />
-                <span>名称一致但 UPC 不一致时也更新</span>
-                <span class="qnh-fm-check__hint">默认勾选:这种商品会走"修改"接口。取消勾选后直接跳过(不新建也不修改)。有覆盖到同名不同商品的风险。仅全量模式生效。</span>
-              </label>
-            </div>
+  function render() {
+    const previous = select.value;
+    const query = search.value.trim().toLowerCase();
+    const ids = /[,，、]/.test(query) ? parseIds(query) : null;
+    const visible = shops.filter(shop => ids
+      ? ids.some(id => String(shop.shopId).includes(id))
+      : [shop.shopName, shop.shopId, shop.region].some(value => String(value ?? '').toLowerCase().includes(query)));
+    select.replaceChildren(new Option('请选择门店', ''), ...visible.map(shop =>
+      new Option([shop.shopName, shop.region, `#${shop.shopId}`].filter(Boolean).join(' · '), String(shop.shopId))));
+    select.value = visible.some(shop => String(shop.shopId) === previous) ? previous : '';
+    if (shops.length === 1 && visible.length === 1) select.selectedIndex = 1;
+    hint.textContent = visible.length ? `共 ${visible.length} 家门店` : '没有匹配的门店';
+    changed();
+  }
 
-            <div class="qnh-fm-section">
-              <span class="qnh-fm-section__label">店内分类映射文件(可选)</span>
-              <div class="qnh-fm-row">
-                <input class="qnh-fm-input" data-id="mapping-name" readonly placeholder="未选择" />
-                <button class="qnh-fm-btn" data-act="pick-mapping">选择文件…</button>
-                <button class="qnh-fm-btn" data-act="clear-mapping" style="display:none">清除</button>
-              </div>
-              <div class="qnh-fm-section__hint">
-                目标店若缺分类,首次导入会在源目录自动生成 <code>front-category-mapping.txt</code> 模板。
-                编辑后再次导入可在这里附带它。
-              </div>
-            </div>
+  search.addEventListener('input', render);
+  select.addEventListener('change', changed);
+  call<ShopBrief[]>({ type: 'FETCH_SHOP_LIST' }).then(list => {
+    shops = list;
+    render();
+  }).catch((err: Error) => {
+    hint.textContent = `门店加载失败 · ${err.message}`;
+    hint.classList.add('error');
+  });
+  return () => shops.find(shop => String(shop.shopId) === select.value);
+}
 
-          </div>
-          <div class="qnh-fm-foot">
-            <span class="qnh-fm-foot__hint" data-id="foot-hint">请选择导入源目录</span>
-            <button class="qnh-fm-action" data-act="cancel">取消</button>
-            <button class="qnh-fm-action primary" data-act="ok" disabled>开始导入</button>
-          </div>
-        </div>
-      </div>
-    `);
+let closeActive: (() => void) | undefined;
 
-    const $ = <T extends HTMLElement = HTMLElement>(sel: string) =>
-      root.querySelector(sel) as T | null;
-    const dirNameEl = $<HTMLInputElement>('[data-id="dir-name"]')!;
-    const dirStatus = $('[data-id="dir-status"]')!;
-    const syncImages = $<HTMLInputElement>('[data-id="sync-images"]')!;
-    const updateOnName = $<HTMLInputElement>('[data-id="update-on-name"]')!;
-    const mappingName = $<HTMLInputElement>('[data-id="mapping-name"]')!;
-    const clearMappingBtn = $<HTMLButtonElement>('[data-act="clear-mapping"]')!;
-    const footHint = $('[data-id="foot-hint"]')!;
-    const okBtn = $<HTMLButtonElement>('[data-act="ok"]')!;
+function openForm<T>(
+  title: string, action: string, body: string,
+  setup: (root: ShadowRoot, refresh: () => void) => {
+    state: () => { hint: string; result?: T };
+    authorize: () => Promise<void>;
+  },
+): Promise<T | null> {
+  closeActive?.();
+  return new Promise(resolve => {
+    const host = document.createElement('div');
+    document.documentElement.append(host);
+    const root = host.attachShadow({ mode: 'open' });
+    root.innerHTML = `<style>${styles}</style><dialog aria-labelledby="title">
+      <header><h2 id="title">${title}</h2><button class="close" aria-label="关闭">×</button></header>
+      <main>${body}</main>
+      <footer><span class="hint" role="status"></span><button class="cancel">取消</button>
+      <button class="primary" disabled>${action}</button></footer></dialog>`;
+    const dialog = root.querySelector('dialog')!;
+    const main = root.querySelector('main')!;
+    const start = root.querySelector<HTMLButtonElement>('.primary')!;
+    const hint = root.querySelector<HTMLElement>('footer .hint')!;
+    let busy = false;
+    const form = setup(root, refresh);
 
-    let dirHandle: FileSystemDirectoryHandle | null = null;
-    let dirOk = false;
-    let mappingFile: File | null = null;
-
-    const dispose = (result: ImportFormResult | null) => {
-      host.remove();
-      resolve(result);
-    };
-
-    root.addEventListener('click', (e) => {
-      const target = e.target as HTMLElement;
-      const act = target.closest<HTMLElement>('[data-act]')?.dataset.act;
-      if (act === 'cancel') dispose(null);
-    });
-    root.querySelector('.qnh-fm-mask')?.addEventListener('click', (e) => {
-      if ((e.target as HTMLElement).classList.contains('qnh-fm-mask')) dispose(null);
-    });
-
-    /* ---- 选目录 ---- */
-    root.querySelector('[data-act="pick-dir"]')?.addEventListener('click', async () => {
-      try {
-        const dir = await pickDirectory({ id: 'qnh-import-dir', mode: 'readwrite' });
-        dirHandle = dir;
-        dirNameEl.value = dir.name;
-        dirStatus.style.display = '';
-        dirStatus.classList.remove('warn', 'err');
-        dirStatus.textContent = '校验目录…';
-        const manifest = await readManifestIfComplete(dir);
-        if (!manifest) {
-          dirOk = false;
-          dirStatus.classList.add('err');
-          dirStatus.textContent =
-            '所选目录里找不到 manifest.json,可能不是导出目录或上次导出未完成。';
-        } else {
-          dirOk = true;
-          dirStatus.classList.remove('err');
-          const m = manifest as {
-            productCount?: number;
-            mediaCount?: number;
-            source?: { shopName?: string };
-          };
-          dirStatus.textContent =
-            `导出包就绪 · ${m.source?.shopName ?? '?'} · ${m.productCount ?? '?'} 个商品 · ${m.mediaCount ?? '?'} 个媒体`;
-        }
-        updateFoot();
-      } catch (e) {
-        if ((e as DOMException)?.name === 'AbortError') return;
-        dirStatus.style.display = '';
-        dirStatus.classList.add('err');
-        dirStatus.textContent = `选择目录失败:${(e as Error).message}`;
-      }
-    });
-
-    /* ---- 选映射文件 ---- */
-    root.querySelector('[data-act="pick-mapping"]')?.addEventListener('click', () => {
-      pickMappingFile().then((f) => {
-        if (!f) return;
-        mappingFile = f;
-        mappingName.value = f.name;
-        clearMappingBtn.style.display = '';
-      });
-    });
-    root.querySelector('[data-act="clear-mapping"]')?.addEventListener('click', () => {
-      mappingFile = null;
-      mappingName.value = '';
-      clearMappingBtn.style.display = 'none';
-    });
-
-    /* ---- 表单状态 ---- */
-    function updateFoot() {
-      okBtn.disabled = !dirOk;
-      footHint.classList.remove('err');
-      if (!dirHandle) {
-        footHint.textContent = '请选择导入源目录';
-      } else if (!dirOk) {
-        footHint.classList.add('err');
-        footHint.textContent = '所选目录不是有效的导出包';
-      } else {
-        const parts: string[] = [];
-        const mode = (root.querySelector<HTMLInputElement>('input[name="qnh-mode"]:checked')?.value ?? 'full');
-        const confirm = (root.querySelector<HTMLInputElement>('input[name="qnh-confirm"]:checked')?.value ?? 'auto');
-        parts.push(mode === 'full' ? '全量' : '增量');
-        parts.push(confirm === 'auto' ? '自动' : '手动');
-        parts.push(syncImages.checked ? '同步图片' : '不同步图片');
-        if (mode === 'full' && updateOnName.checked) parts.push('同名异UPC也改');
-        if (mappingFile) parts.push('附带映射');
-        footHint.textContent = parts.join(' · ');
-      }
+    function refresh() {
+      const state = form.state();
+      start.disabled = busy || !state.result;
+      hint.classList.remove('error');
+      hint.textContent = busy ? '正在获取目录权限…' : state.hint;
     }
-    root.addEventListener('change', updateFoot);
-    syncImages.addEventListener('change', updateFoot);
-    updateOnName.addEventListener('change', updateFoot);
 
-    /* ---- 提交 ---- */
-    root.querySelector('[data-act="ok"]')?.addEventListener('click', () => {
-      if (!dirHandle || !dirOk) return;
-      const mode = (root.querySelector<HTMLInputElement>('input[name="qnh-mode"]:checked')?.value as 'full' | 'incremental') ?? 'full';
-      const confirmMode = (root.querySelector<HTMLInputElement>('input[name="qnh-confirm"]:checked')?.value as 'auto' | 'manual') ?? 'auto';
-      dispose({
-        sourceDir: dirHandle,
-        mode,
-        confirmMode,
-        syncImages: syncImages.checked,
-        updateOnNameMatch: updateOnName.checked,
-        frontCategoryMappingFile: mappingFile,
-      });
+    function finish(result: T | null) {
+      if (!host.isConnected) return;
+      dialog.close();
+      host.remove();
+      closeActive = undefined;
+      resolve(result);
+    }
+
+    closeActive = () => finish(null);
+    for (const button of root.querySelectorAll('.close, .cancel')) button.addEventListener('click', closeActive);
+    dialog.addEventListener('cancel', event => { event.preventDefault(); finish(null); });
+    dialog.addEventListener('click', event => {
+      if (event.target !== dialog) return;
+      const box = dialog.getBoundingClientRect();
+      if (event.clientX < box.left || event.clientX > box.right ||
+          event.clientY < box.top || event.clientY > box.bottom) finish(null);
     });
+    start.addEventListener('click', async () => {
+      const { result } = form.state();
+      if (!result || busy) return;
+      busy = true;
+      main.inert = true;
+      refresh();
+      try {
+        await form.authorize();
+        finish(result);
+      } catch (err) {
+        busy = false;
+        main.inert = false;
+        refresh();
+        hint.textContent = `目录授权失败，请重试或重新浏览。${(err as Error).message}`;
+        hint.classList.add('error');
+      }
+    });
+    root.addEventListener('change', refresh);
+    dialog.showModal();
+    refresh();
   });
 }
 
-/* 弹出系统文件选择器,选一个 .txt / .tsv / .csv 文件,用户取消返回 null */
-function pickMappingFile(): Promise<File | null> {
-  return new Promise((resolve) => {
-    const input = document.createElement('input');
-    input.type = 'file';
-    input.accept = '.txt,.tsv,.csv,text/plain';
-    input.style.display = 'none';
-    let settled = false;
-    const finish = (f: File | null) => {
-      if (settled) return;
-      settled = true;
-      input.remove();
-      resolve(f);
+function input(root: ShadowRoot, id: string) {
+  return root.querySelector<HTMLInputElement>(`#${id}`)!;
+}
+
+async function inspectSource(dir: FileSystemDirectoryHandle) {
+  const manifest = await readManifestIfComplete(dir);
+  if (!manifest) throw new Error(`项目「${dir.name}」缺少 manifest.json，请选择已完成导出的项目。`);
+  try {
+    await dir.getDirectoryHandle('products');
+  } catch (err) {
+    if ((err as Error).name !== 'NotFoundError') throw err;
+    throw new Error('目录缺少 products 子文件夹。');
+  }
+  return `${manifest.source.shopName ?? '导出包'} · ${manifest.productCount} 个商品`;
+}
+
+export function openExportForm(args: OpenExportFormArgs) {
+  const filters = [
+    ['spu-name', '商品名称', args.initialSpuNameKeyword],
+    ['spu-ids', 'SPU ID', args.initialSpuIds],
+    ['sku-ids', 'SKU ID', args.initialSkuIds],
+    ['sku-upcs', '商品条码 / UPC', args.initialSkuUpcs],
+  ] as const;
+  const body = shopMarkup('来源门店') + directoryMarkup('导出到') +
+    section('媒体文件',
+      choice('images', '下载图片', '关闭后保留原图链接', true) +
+      choice('video', '下载视频', '导入时需手动补传视频')) +
+    `<section aria-labelledby="export-filters-title">
+      <h3 id="export-filters-title">商品筛选</h3>
+      <p class="hint">留空导出全店。多个编号可用逗号或空格分隔。指定 SPU ID 时仅按该清单导出。</p>
+      <div class="filter-grid">${filters.map(([id, label]) => `<label>${label}<input type="text" id="${id}"></label>`).join('')}</div>
+    </section>`;
+
+  return openForm<ExportFormResult>('导出本店商品', '开始导出', body, (root, refresh) => {
+    for (const [id, , value] of filters) input(root, id).value = value ?? '';
+    root.addEventListener('input', refresh);
+    const shopValue = bindShop(root, args.callInjected, refresh);
+    const directory = bindDirectory(root, 'export', detectExportTargetStatus, () => {
+      input(root, 'resume').checked = true;
+      refresh();
+    });
+    const extra = root.querySelector<HTMLElement>('[data-dir-extra]')!;
+    extra.className = 'choices resume';
+    extra.innerHTML = choice('resume', '继续上次', '接续已完成的商品', true, 'restart') +
+      choice('restart', '重新导出', '丢弃旧进度', false, 'restart');
+
+    return {
+      authorize: directory.authorize,
+      state() {
+        const shop = shopValue();
+        const chosen = directory.selection;
+        const status: ExportTargetStatus | undefined = chosen?.info;
+        const includeImages = input(root, 'images').checked;
+        const includeVideo = input(root, 'video').checked;
+        const ids = parseIds(input(root, 'spu-ids').value);
+        const spuNameKeyword = ids ? null : input(root, 'spu-name').value.trim() || null;
+        const skuIdList = ids ? null : parseIds(input(root, 'sku-ids').value);
+        const skuUpcList = ids ? null : parseIds(input(root, 'sku-upcs').value);
+        const filterKey = exportFilterKey({ spuIdAllowlist: ids ?? undefined, spuNameKeyword: spuNameKeyword ?? undefined,
+          skuIdList: skuIdList ?? undefined, skuUpcList: skuUpcList ?? undefined });
+        const resumable = status?.kind === 'incomplete' && !!shop &&
+          String(status.progress.source.shopId) === String(shop.shopId) &&
+          status.progress.options.includeVideo === includeVideo &&
+          (status.progress.options.filterKey ?? '') === filterKey &&
+          (status.progress.options.includeImages ?? true) === includeImages;
+        extra.hidden = !resumable;
+        for (const id of ['sku-ids', 'sku-upcs', 'spu-name']) input(root, id).disabled = !!ids;
+        let startMode: ExportFormResult['startMode'] = 'fresh';
+        if (status?.kind === 'complete') {
+          startMode = 'overwrite';
+          directory.message(`已有完整导出（${status.manifest.source.shopName ?? '未知门店'}，${status.manifest.productCount} 个商品）。开始后将覆盖已有导出。`, 'warn');
+        } else if (status?.kind === 'incomplete') {
+          startMode = resumable && input(root, 'resume').checked ? 'resume' : 'overwrite';
+          const next = !resumable ? '门店、商品筛选和媒体设置与上次一致时可续传。按当前设置开始将重新导出。'
+            : startMode === 'resume' ? '将继续上次任务。' : '开始后将重新导出。';
+          directory.message(`已有未完成的导出，已写入 ${status.progress.doneSpuIds.length} 个商品。${next}`, 'warn');
+        } else if (status) directory.message('商品及媒体文件将直接写入此目录。');
+        if (!shop || !chosen) return { hint: !shop ? '请选择来源门店' : directory.hint };
+        return {
+          hint: `${shop.shopName ?? shop.shopId} · ${ids ? `指定 ${ids.length} 个 SPU` : '准备就绪'}`,
+          result: {
+            shop, startMode, includeImages, includeVideo,
+            targetDir: chosen.dir,
+            spuIdAllowlist: ids,
+            spuNameKeyword, skuIdList, skuUpcList,
+          },
+        };
+      },
     };
-    input.addEventListener('change', () => finish(input.files?.[0] ?? null));
-    const onFocus = () => {
-      window.removeEventListener('focus', onFocus);
-      setTimeout(() => {
-        if (!input.files || input.files.length === 0) finish(null);
-      }, 300);
-    };
-    window.addEventListener('focus', onFocus);
-    document.body.appendChild(input);
-    input.click();
+  });
+}
+
+export function openSyncForm(args: { callInjected: CallInjected }) {
+  const body = shopMarkup('目标门店') + directoryMarkup('数据源目录') +
+    section('同步内容', choice('stock', '库存', '以源 SKU 库存覆盖目标门店库存', true) +
+      choice('price', '零售价', '将固定价同步至美团闪购和饿了么', true));
+  return openForm<SyncFormResult>('同步库存与零售价', '开始同步', body, (root, refresh) => {
+    const shopValue = bindShop(root, args.callInjected, refresh);
+    const directory = bindDirectory(root, 'sync', inspectSource, refresh);
+    return { authorize: directory.authorize, state() {
+      const chosen = directory.selection;
+      const shop = shopValue();
+      const syncStock = input(root, 'stock').checked;
+      const syncPrice = input(root, 'price').checked;
+      if (chosen) directory.message(chosen.info);
+      if (!shop) return { hint: '请选择目标门店' };
+      if (!chosen) return { hint: directory.hint };
+      if (!syncStock && !syncPrice) return { hint: '请至少选择一项同步内容' };
+      return { hint: `目标门店 · ${shop.shopName ?? shop.shopId}`, result: { shop, syncStock, syncPrice, sourceDir: chosen.dir } };
+    } };
+  });
+}
+
+export function openImportForm(storeCall?: CallInjected) {
+  const body = (storeCall ? shopMarkup('目标门店') : '') + directoryMarkup('导入源目录') +
+    (storeCall ? `<section><h3>门店新建</h3>
+      <p class="hint">已有匹配商品时跳过。每个规格按总部零售价新建，各渠道同价时统一设置，异价时保留分渠道定价。库存和门店渠道价可在导入后同步。</p>
+      <label>采购单价（可选）<input type="text" inputmode="decimal" id="purchase-price" placeholder="元 / 基础销售单位"></label>
+      <p class="hint">填写后，对本批新建商品的每个规格使用此采购价和默认供应关系。留空可稍后在门店配置。</p></section>` :
+      section('导入模式', choice('full', '全量导入', '更新有差异的商品，并创建缺少的商品', true, 'mode') +
+      choice('incremental', '增量导入', '已有 UPC 或同名商品直接跳过', false, 'mode'))) +
+    section('执行方式', choice('auto', '自动执行', '依次写入商品', true, 'confirm') +
+      choice('manual', '逐条确认', '每次写入前可确认或跳过', false, 'confirm')) +
+    section('商品设置', choice('images', '同步图片', '关闭后跳过图片上传和比对', true) +
+      (storeCall ? '' : choice('by-name', '更新同名异 UPC 商品', '仅全量模式生效，可能覆盖同名商品', true))) +
+    `<details><summary>店内分类映射文件</summary><p class="hint">目标店缺少分类时，编辑源目录中的 front-category-mapping.txt，然后在此选择。</p>
+      <div class="file-row"><input id="mapping" aria-label="店内分类映射文件" type="file" accept=".txt,.csv,.tsv,text/plain"><button id="clear" hidden>清除</button></div></details>`;
+  return openForm<ImportFormResult>(storeCall ? '导入本店商品' : '导入商品', '开始导入', body, (root, refresh) => {
+    const getShop = storeCall && bindShop(root, storeCall, refresh);
+    if (storeCall) input(root, 'purchase-price').addEventListener('input', refresh);
+    const directory = bindDirectory(root, 'import', inspectSource, refresh);
+    const file = input(root, 'mapping');
+    const clear = root.querySelector<HTMLButtonElement>('#clear')!;
+    clear.onclick = () => { file.value = ''; refresh(); };
+    return { authorize: directory.authorize, state() {
+      const chosen = directory.selection;
+      const full = !storeCall && input(root, 'full').checked;
+      const manual = input(root, 'manual').checked;
+      const byName = input(root, 'by-name');
+      if (byName) byName.disabled = !full;
+      const shop = getShop?.();
+      const price = storeCall ? input(root, 'purchase-price').value.trim() : '';
+      const mapping = file.files?.[0] ?? null;
+      clear.hidden = !mapping;
+      if (storeCall && !shop) return { hint: '请选择目标门店' };
+      if (price && (!/^\d+(\.\d{1,2})?$/.test(price) || !Number.isFinite(Number(price)) || Number(price) <= 0)) {
+        return { hint: '采购单价须大于 0，最多两位小数' };
+      }
+      if (!chosen) return { hint: directory.hint };
+      directory.message(chosen.info);
+      return { hint: [shop?.shopName ?? (full ? '全量' : '增量'), manual ? '逐条确认' : '自动执行', mapping && '已附带分类映射'].filter(Boolean).join(' · '),
+        result: { sourceDir: chosen.dir, shop, purchaseUnitPrice: price ? Number(price) : undefined, mode: full ? 'full' : 'incremental', confirmMode: manual ? 'manual' : 'auto',
+          syncImages: input(root, 'images').checked, updateOnNameMatch: full && byName.checked, frontCategoryMappingFile: mapping } };
+    } };
   });
 }
