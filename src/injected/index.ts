@@ -46,6 +46,12 @@ window.addEventListener('message', async (ev) => {
       case 'FETCH_FRONT_CATEGORY_TREE':
         result = await api.fetchFrontCategoryTree(cmd.payload);
         break;
+      case 'FETCH_STORE_RELATION_CATEGORY':
+        result = await api.fetchStoreRelationCategory(cmd.payload);
+        break;
+      case 'CREATE_FRONT_CATEGORY':
+        result = await api.createFrontCategory(cmd.payload);
+        break;
       case 'FETCH_PRODUCT_LIST':
         result = await api.fetchProductList(cmd.payload);
         break;

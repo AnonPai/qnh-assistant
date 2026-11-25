@@ -1,6 +1,6 @@
 {
   "name": "qnh-assistant",
-  "version": "0.1.6",
+  "version": "0.1.15",
   "private": true,
   "description": "美团牵牛花跨账号商品同步助手 (Edge 插件)",
   "type": "module",

@@ -1,8 +1,6 @@
-export type DirectoryTask = 'export' | 'import' | 'sync';
-type DirectoryKey = DirectoryTask | 'workspace-root';
-
 const storeName = 'directories';
-const sessionOnly = new Map<DirectoryKey, FileSystemDirectoryHandle>();
+const workspaceKey = 'workspace-root';
+let sessionRoot: FileSystemDirectoryHandle | undefined;
 
 // IndexedDB 可以直接保存目录句柄，读取时仍受浏览器的文件权限控制。
 function openDirectoryDb(): Promise<IDBDatabase> {
@@ -14,12 +12,12 @@ function openDirectoryDb(): Promise<IDBDatabase> {
   });
 }
 
-export async function lastDirectory(task: DirectoryKey): Promise<FileSystemDirectoryHandle | undefined> {
-  if (sessionOnly.has(task)) return sessionOnly.get(task);
+export async function loadWorkspaceRoot(): Promise<FileSystemDirectoryHandle | undefined> {
+  if (sessionRoot) return sessionRoot;
   const db = await openDirectoryDb();
   try {
     return await new Promise<FileSystemDirectoryHandle | undefined>((resolve, reject) => {
-      const request = db.transaction(storeName).objectStore(storeName).get(task);
+      const request = db.transaction(storeName).objectStore(storeName).get(workspaceKey);
       request.onsuccess = () => resolve(request.result);
       request.onerror = () => reject(request.error);
     });
@@ -28,7 +26,7 @@ export async function lastDirectory(task: DirectoryKey): Promise<FileSystemDirec
   }
 }
 
-export async function rememberDirectory(task: DirectoryKey, dir: FileSystemDirectoryHandle): Promise<boolean> {
+export async function saveWorkspaceRoot(dir: FileSystemDirectoryHandle): Promise<boolean> {
   try {
     const db = await openDirectoryDb();
     try {
@@ -36,15 +34,15 @@ export async function rememberDirectory(task: DirectoryKey, dir: FileSystemDirec
         const tx = db.transaction(storeName, 'readwrite');
         tx.oncomplete = () => resolve();
         tx.onabort = () => reject(tx.error);
-        tx.objectStore(storeName).put(dir, task);
+        tx.objectStore(storeName).put(dir, workspaceKey);
       });
     } finally {
       db.close();
     }
-    sessionOnly.delete(task);
+    sessionRoot = undefined;
     return true;
   } catch {
-    sessionOnly.set(task, dir);
+    sessionRoot = dir;
     return false;
   }
 }

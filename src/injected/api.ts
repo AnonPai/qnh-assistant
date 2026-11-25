@@ -32,11 +32,11 @@ import type {
   CategorySnapshot,
   ProductSpu,
 } from '@shared/types';
-import type { ShopBrief, ShopInfo } from '@shared/messaging';
+import type { FrontCategoryNode, FrontCategoryTree, ProductListPage, ShopBrief, ShopInfo } from '@shared/messaging';
 
 // ---- 通用工具 ----
 
-const DEFAULT_CSEC_VERSION = '4.2.4';
+const DEFAULT_CSEC_VERSION = '4.3.0';
 let cachedCsecVersion: string | undefined;
 
 function isCsecVersion(value: string | null | undefined): value is string {
@@ -111,6 +111,18 @@ async function siteFetch<T = unknown>(
   const ct = res.headers.get('content-type') || '';
   if (ct.includes('application/json')) return parseJson ? parseJson(await res.text()) : (await res.json()) as T;
   return (await res.text()) as unknown as T;
+}
+
+function parseProductResponse<T>(text: string): T {
+  return JSON.parse(text, (key, value, context?: { source?: string }) => {
+    // 商品接口也会用 JSON 数字返回长 ID。用原始数字文本保留完整编号。
+    if (typeof value === 'number' && !Number.isSafeInteger(value) &&
+        ['skuId', 'spuId', 'categoryId', 'parentCategoryId'].includes(key)) {
+      const source = context?.source;
+      if (source && /^\d+$/.test(source)) return source;
+    }
+    return value;
+  }) as T;
 }
 
 // ============================================================
@@ -202,12 +214,13 @@ interface FrontCategoryQueryResp {
   code: number;
   msg?: string;
   /** 服务端把整棵树序列化为 JSON 字符串放在 data 里 */
-  data?: string;
+  data?: string | { categoryList?: RawFrontCategory[]; storeGroupId?: string | number };
 }
 
 interface RawFrontCategory {
-  categoryId: string;
-  parentCategoryId: string;
+  categoryId: string | number;
+  parentCategoryId: string | number;
+  storeGroupId?: string | number;
   name: string;
   level: number;
   enable: number;
@@ -216,8 +229,9 @@ interface RawFrontCategory {
 
 export async function fetchFrontCategoryTree(payload: {
   shopId: string | number;
-}): Promise<import('@shared/messaging').FrontCategoryNode[]> {
-  void payload; // 接口本身按当前登录租户/选中门店上下文返回,不需要参数
+  storeGroupId?: number;
+}): Promise<FrontCategoryTree> {
+  const { storeGroupId } = payload;
   const resp = await siteFetch<FrontCategoryQueryResp>(
     qnhApiPath('/qnh-gw3/api/product/support/front-category/query'),
     {
@@ -225,29 +239,90 @@ export async function fetchFrontCategoryTree(payload: {
       headers: {
         'Content-Type': 'application/json',
         'm-appkey': 'fe_recofesaascrm',
-        qnhreferrer: '/unifiedGoods/store/create',
+        qnhreferrer: storeGroupId ? '/unifiedGoods/front-category' : '/unifiedGoods/store/create',
       },
-      body: JSON.stringify({ storeGroupId: 0, sceneIdentity: 10, storeSpuCustomFlag: 0 }),
+      body: JSON.stringify({ storeGroupId: storeGroupId ?? 0, sceneIdentity: storeGroupId ? 20 : 10, storeSpuCustomFlag: 0 }),
     },
+    parseProductResponse,
   );
   if (resp?.code !== 0 || !resp.data) {
     throw new Error(`店内分类接口失败: ${resp?.msg ?? 'unknown'}`);
   }
-  let parsed: { categoryList?: RawFrontCategory[] };
+  let parsed: Exclude<FrontCategoryQueryResp['data'], string | undefined>;
   try {
-    parsed = JSON.parse(resp.data);
+    parsed = typeof resp.data === 'string' ? parseProductResponse(resp.data) : resp.data;
   } catch {
     throw new Error('店内分类接口返回数据无法解析');
   }
-  const trim = (n: RawFrontCategory): import('@shared/messaging').FrontCategoryNode => ({
-    categoryId: String(n.categoryId),
-    parentCategoryId: String(n.parentCategoryId ?? '0'),
-    name: n.name,
-    level: n.level,
-    enable: n.enable,
-    children: (n.children ?? []).map(trim),
-  });
-  return (parsed.categoryList ?? []).map(trim);
+  if (storeGroupId && !Array.isArray(parsed.categoryList) && parsed.storeGroupId == null) {
+    throw new Error('接口未返回目标分组的分类列表。');
+  }
+  const groups = new Set<number>();
+  const collectGroup = (value?: string | number) => {
+    const id = Number(value);
+    if (Number.isSafeInteger(id) && id > 0) groups.add(id);
+  };
+  collectGroup(parsed.storeGroupId);
+  const trim = (n: RawFrontCategory): FrontCategoryNode => {
+    collectGroup(n.storeGroupId);
+    return {
+      categoryId: String(n.categoryId), parentCategoryId: String(n.parentCategoryId ?? '0'),
+      name: n.name, level: n.level, enable: n.enable, children: (n.children ?? []).map(trim),
+    };
+  };
+  const categories = (parsed.categoryList ?? []).map(trim);
+  if (storeGroupId && [...groups].some(group => group !== storeGroupId)) {
+    throw new Error('返回的店内分类与指定分组不一致。');
+  }
+  return { categories, storeGroupId: groups.size === 1 ? [...groups][0] : undefined };
+}
+
+export async function fetchStoreRelationCategory({ shopId }: { shopId: string | number }): Promise<{ storeId: number }> {
+  const storeId = numericStoreId(shopId);
+  const resp = await siteFetch<{ code: number; success?: boolean; msg?: string; data?: unknown }>(
+    qnhApiPath('/qnh-gw3/api/product/support/front-category/query-store-relation-category'), {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'm-appkey': 'fe_recofesaascrm',
+        qnhreferrer: '/unifiedGoods/front-category',
+      },
+      body: JSON.stringify({ storeId, needChannelException: true, needHasPriceAdjustRate: true, needRelationSpuCount: true }),
+    },
+  );
+  if (resp?.code !== 0 || resp.success === false) throw new Error(resp?.msg ?? '门店关联分类查询失败。');
+
+  let data = resp.data;
+  if (typeof data === 'string') {
+    try { data = JSON.parse(data); } catch { throw new Error('门店关联分类响应无法解析。'); }
+  }
+  if (data && typeof data === 'object' && 'storeId' in data && data.storeId != null &&
+      String(data.storeId) !== String(storeId)) {
+    throw new Error('返回的关联分类与所选门店不一致。');
+  }
+  return { storeId };
+}
+
+export async function createFrontCategory({ storeGroupId, parentCategoryId, name }: {
+  storeGroupId: number;
+  parentCategoryId: string;
+  name: string;
+}) {
+  if (!Number.isSafeInteger(storeGroupId) || storeGroupId <= 0 || !/^\d+$/.test(parentCategoryId) || !name.trim()) {
+    throw new Error('创建分类需要有效的分类分组、父级 ID 和名称。');
+  }
+  const resp = await siteFetch<{ code: number; success?: boolean; msg?: string }>(
+    qnhApiPath('/qnh-gw3/api/product/support/front-category/create'), {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'm-appkey': 'fe_recofesaascrm',
+        qnhreferrer: '/unifiedGoods/front-category',
+      },
+      body: JSON.stringify({ parentCategoryId, storeGroupId, sceneIdentity: 20, storeSpuCustomFlag: 0, name, channelIdList: [0] }),
+    },
+  );
+  if (resp?.code !== 0 || resp.success === false) throw new Error(resp?.msg ?? '店内分类创建失败');
 }
 
 // ============================================================
@@ -273,16 +348,19 @@ interface PageQuerySpuResp {
   };
 }
 
+interface RawListSku {
+  skuId?: string | number;
+  upc?: string | null;
+  upcList?: string[] | null;
+}
+
 interface RawSpuItem {
   spuId: string | number;
   spuName?: string;
   goodsName?: string;
   picUrlList?: string[];
-  skus?: Array<{
-    skuId: string | number;
-    specName?: string;
-    upcList?: string[];
-  }>;
+  skus?: RawListSku[];
+  storeSkuList?: RawListSku[];
   spuChannelInfoList?: Array<{
     channelId?: number;
     categoryCode?: string;
@@ -312,7 +390,7 @@ export async function fetchProductList(payload: {
   upcList?: string[];
   /**
    * SKU id 列表过滤,best-effort 透传(同上)。后端如忽略,
-   * 调用方可在拿到结果后按每个 SPU 的 skuIdList 本地精确比对。
+   * 调用方可按返回的规格列表本地精确比对。
    */
   skuIdList?: Array<string | number>;
   /**
@@ -323,10 +401,7 @@ export async function fetchProductList(payload: {
    *      export 走这个,避免把整个租户主档当成单店商品导出。
    */
   scope?: 'tenant' | 'store';
-}): Promise<{
-  list: Array<{ spuId: string | number; name: string; upcList: string[]; skuIdList: string[] }>;
-  total: number;
-}> {
+}): Promise<ProductListPage> {
   if (payload.scope === 'store') {
     return fetchProductListStore(payload);
   }
@@ -341,10 +416,7 @@ async function fetchProductListTenant(payload: {
   spuName?: string;
   upcList?: string[];
   skuIdList?: Array<string | number>;
-}): Promise<{
-  list: Array<{ spuId: string | number; name: string; upcList: string[]; skuIdList: string[] }>;
-  total: number;
-}> {
+}): Promise<ProductListPage> {
   void payload.shopId; // 租户端接口不再需要 shopId,通过 cookie 上下文识别租户
 
   const body: Record<string, unknown> = {
@@ -387,7 +459,7 @@ async function fetchProductListTenant(payload: {
  * store 维度:只列出当前门店"在架/在售"的 SPU。
  * 接口: POST /qnh-gw3/api/product/store/page-query-spu
  *   - 通过 storeIdList 限定门店
- *   - 字段名与 tenant 端一致(picUrlList / skus / spuChannelInfoList 等)
+ *   - SKU 列表兼容 skus 和 storeSkuList
  *   - 总数对应"门店商品"页签上看到的数量(几千~两万级)
  */
 async function fetchProductListStore(payload: {
@@ -397,10 +469,7 @@ async function fetchProductListStore(payload: {
   spuName?: string;
   upcList?: string[];
   skuIdList?: Array<string | number>;
-}): Promise<{
-  list: Array<{ spuId: string | number; name: string; upcList: string[]; skuIdList: string[] }>;
-  total: number;
-}> {
+}): Promise<ProductListPage> {
   const body: Record<string, unknown> = {
     labelInfoList: [],
     storeFrontGroupCategoryList: [],
@@ -428,6 +497,7 @@ async function fetchProductListStore(payload: {
       },
       body: JSON.stringify(body),
     },
+    parseProductResponse,
   );
 
   if (data?.code !== 0) {
@@ -437,35 +507,22 @@ async function fetchProductListStore(payload: {
   return mapPageQueryResp(data);
 }
 
-/** 把 page-query 响应里的 list 拍平成调用方需要的 { spuId, name, upcList, skuIdList } 形态 */
-function mapPageQueryResp(data: PageQuerySpuResp): {
-  list: Array<{ spuId: string | number; name: string; upcList: string[]; skuIdList: string[] }>;
-  total: number;
-} {
+function readSkuUpcs({ upcList, upc }: RawListSku): string[] {
+  return [...new Set([...(upcList ?? []), upc].filter(Boolean).map(String))];
+}
+
+/** 保留规格与条码的关联，也提供导入查询使用的商品级条码列表。 */
+function mapPageQueryResp(data: PageQuerySpuResp): ProductListPage {
   const list = (data.data?.list ?? []).map((spu) => {
-    const upcList: string[] = [];
-    const upcSeen = new Set<string>();
-    const skuIdList: string[] = [];
-    const skuSeen = new Set<string>();
-    for (const sku of spu.skus ?? []) {
-      for (const upc of sku.upcList ?? []) {
-        if (!upc || upcSeen.has(upc)) continue;
-        upcSeen.add(upc);
-        upcList.push(upc);
-      }
-      if (sku.skuId != null) {
-        const sid = String(sku.skuId);
-        if (!skuSeen.has(sid)) {
-          skuSeen.add(sid);
-          skuIdList.push(sid);
-        }
-      }
-    }
+    const skus = [...(spu.skus ?? []), ...(spu.storeSkuList ?? [])].map(sku => ({
+      skuId: sku.skuId,
+      upcList: readSkuUpcs(sku),
+    }));
     return {
       spuId: spu.spuId,
-      name: spu.spuName ?? spu.goodsName ?? String(spu.spuId),
-      upcList,
-      skuIdList,
+      name: spu.spuName?.trim() || spu.goodsName?.trim() || String(spu.spuId),
+      upcList: [...new Set(skus.flatMap(sku => sku.upcList))],
+      skus,
     };
   });
   return {
@@ -684,6 +741,7 @@ export async function fetchProductDetail(payload: {
       },
       body: JSON.stringify({ spuId: payload.spuId }),
     },
+    parseProductResponse,
   );
 
   if (resp?.code !== 0 || !resp.data) {
@@ -1110,27 +1168,39 @@ function numericStoreId(value: string | number) {
   return id;
 }
 
-function storeRetailPrice(sku: RawTenantSku, exportedPrice?: number) {
+function storeRetailPrice(sku: RawTenantSku, source: ProductSpu['skus'][number]) {
   const hq = sku.suggestPrice?.tenantSuggestPrice;
   const channels = hq?.channelSuggestPriceList ?? [];
-  const positive = (p: unknown) => Number.isFinite(Number(p)) && Number(p) > 0;
+  const label = sku.specName?.trim() ? `规格「${sku.specName.trim()}」` : `SKU ${sku.skuId ?? source.sourceSkuId ?? '（未编号）'}`;
+  const positive = (p: unknown) => (typeof p === 'string' || typeof p === 'number') &&
+    Number.isFinite(Number(p)) && Number(p) > 0;
+  const formatChannels = (list: Array<{ channelId: string | number; suggestPrice: string }>) => {
+    const price = list[0].suggestPrice;
+    return list.every(c => c.suggestPrice === price)
+      ? { tenantSuggestPrice: { unifiedSuggestPrice: price } }
+      : { tenantSuggestPrice: { channelSuggestPriceList: list } };
+  };
   if (channels.length) {
     if (channels.some(c => !positive(c.suggestPrice) || !positive(c.channelId))) {
-      throw new Error(`规格「${sku.specName ?? ''}」的分渠道总部零售价不完整`);
+      throw new Error(`${label} 的分渠道总部零售价不完整`);
     }
-    const list = channels.map(c => ({ channelId: c.channelId, suggestPrice: String(Number(c.suggestPrice)) }));
-    if (!list.every(c => c.suggestPrice === list[0].suggestPrice)) {
-      return { tenantSuggestPrice: { channelSuggestPriceList: list } };
-    }
-    return { tenantSuggestPrice: { unifiedSuggestPrice: list[0].suggestPrice } };
+    return formatChannels(channels.map(c => ({ channelId: c.channelId, suggestPrice: String(Number(c.suggestPrice)) })));
   }
-  const price = [hq?.unifiedSuggestPrice, exportedPrice, sku.basicPrice].find(positive);
-  if (price == null) throw new Error(`规格「${sku.specName ?? ''}」缺少有效的总部零售价`);
-  return { tenantSuggestPrice: { unifiedSuggestPrice: String(Number(price)) } };
+  const price = [hq?.unifiedSuggestPrice, source.price, sku.basicPrice].find(positive);
+  if (price != null) return { tenantSuggestPrice: { unifiedSuggestPrice: String(Number(price)) } };
+
+  const storeChannels = (source.channelPrices ?? []).filter(c => positive(c.channelId) && positive(c.price));
+  if (storeChannels.length) {
+    return formatChannels(storeChannels.map(c => ({ channelId: c.channelId, suggestPrice: String(Number(c.price)) })));
+  }
+  if (positive(source.onlinePrice)) {
+    return { tenantSuggestPrice: { unifiedSuggestPrice: String(Number(source.onlinePrice)) } };
+  }
+  throw new Error(`${label} 缺少有效的总部建议售价和源门店线上零售价，请核对源商品定价后重新导出。`);
 }
 
 async function createStoreProduct(
-  shopId: string | number, product: ProductSpu, detail: RawProductDetail, mapped: Record<string, unknown>,
+  shopId: string | number, product: ProductSpu, detail: RawProductDetail, mapped: ReturnType<typeof buildTenantSpuV2>,
 ): Promise<string | number> {
   const rawSkus = detail.skus ?? [];
   if (!rawSkus.length || rawSkus.length !== product.skus.length) throw new Error('门店新建需要完整的 SKU 清单');
@@ -1143,7 +1213,7 @@ async function createStoreProduct(
   // 两份门店新建抓包的 storePrice 都是 9999，即使各 SKU 的总部零售价不同。
   const skuList = rawSkus.map((s, i) => ({ specName: makeSpecName(s), storePrice: String(sources[i].storePrice ?? 9999), customizeStockFlag: 1 }));
   const skus = (mapped.skus as Array<Record<string, unknown>>).map((sku, i) => ({
-    ...sku, suggestPrice: storeRetailPrice(rawSkus[i], sources[i].price),
+    ...sku, suggestPrice: storeRetailPrice(rawSkus[i], sources[i]),
     skuChannelInfoList: (sku.skuChannelInfoList as Array<Record<string, unknown>>).map(c =>
       jd && Number(c.channelId) === 300 ? { ...c, saleAttrValueList: jd.values[i] } : c),
     customizeNoUpcCode: rawSkus[i].customizeNoUpcCode ?? 0,
@@ -1157,19 +1227,23 @@ async function createStoreProduct(
     categoryProperties: c.categoryProperties, saleAttrList: Number(c.channelId) === 300 && jd ? jd.dimensions : c.saleAttrList, skuPicSetting: c.skuPicSetting,
     brandInfo: c.brandInfo, specialPictureList: c.specialPictureList,
   }));
+  // 门店分类使用所选门店的分类 ID。主档的分类字段使用总部分类目录。
+  const storeMainFrontCategoryIdList = uniqueStrings(mapped.storeFrontCategoryList.flatMap(group =>
+    group.storeCategoryList.map(category => String(category.categoryCode)),
+  ));
   const tenantSpu = {
     spuName: product.name, weightType: mapped.weightType, specType: mapped.specType, onlineStatus: mapped.onlineStatus,
     customizedChannelName: detail.customizedChannelName ?? {}, spuChannelInfoList: channels,
     picUrlList: mapped.picUrlList, picContentList: mapped.picContentList, videoInfo: mapped.videoInfo ?? null,
     brand: detail.brand ?? {}, backendCategory: { categoryCode: detail.backendCategory?.categoryCode ?? null },
-    storeFrontCategoryList: mapped.storeFrontCategoryList, matchMedicalStandard: detail.matchMedicalStandard,
+    storeFrontCategoryList: [], matchMedicalStandard: detail.matchMedicalStandard,
     aiRecommendInfo: detail.aiRecommendInfo ?? {}, otherQualificationInfo: detail.otherQualificationInfo ?? { fileList: [] },
     sellPoint: detail.sellPoint, description: detail.description, skus,
   };
   const resp = await siteFetch<CreateProductResp & { spuId?: string | number; success?: boolean }>(
     qnhApiPath('/qnh-gw3/api/product/store/create'), {
       method: 'POST', headers: storeCreateHeaders,
-      body: JSON.stringify({ storeId: numericStoreId(shopId), tenantSpu, storeSpu: { skuList,
+      body: JSON.stringify({ storeId: numericStoreId(shopId), tenantSpu, storeSpu: { skuList, storeMainFrontCategoryIdList,
         mtSpecialPictureList: channels.find(c => Number(c.channelId) === 100)?.specialPictureList },
         adjustStock: { comment: 'WEB-门店商品新增规格调整库存', skuList: [] },
         source: 2, createType: 3, fieldUpgrade: { newProperty: false } }),
@@ -1186,14 +1260,11 @@ async function createStoreProduct(
 }
 
 export async function setNewStorePurchase(payload: import('@shared/messaging').StorePurchaseRequest) {
-  const { shopId, targetSpuId, unitPrice, specs } = payload;
-  if (!specs.length || (unitPrice != null && (!Number.isFinite(unitPrice) || unitPrice <= 0 ||
-      specs.some(s => !s.saleUnit || !s.spec)))) throw new Error('采购单价、规格或销售单位无效');
-  const purchaseInfo = specs.map(({ spec, saleUnit }) => ({
+  const { shopId, targetSpuId, specs } = payload;
+  if (!specs.length) throw new Error('缺少门店商品规格');
+  const purchaseInfo = specs.map(spec => ({
     skuId: null, spec, purchaseStatus: 1, purchaseType: 1, distributeType: 1, distributeId: null,
-    newSupplyRelations: unitPrice == null ? [] : [{ supplierId: -1, supplyUnit: saleUnit, supplyUnitRatio: 1,
-      baseSupplyUnitPrice: unitPrice, minOrderQuantity: 1, masterFlag: 1, settleMethod: 2,
-      payMethod: 2, orderMultiple: 1, offlineGoods: {} }],
+    newSupplyRelations: [],
   }));
   const resp = await siteFetch<{ code: number; success?: boolean; msg?: string }>(qnhApiPath('/api/v1/store/spu/create'), {
     method: 'POST', headers: storeCreateHeaders,
@@ -1364,7 +1435,7 @@ interface BuildTenantSpuV2Args {
 function buildTenantSpuV2(
   direction: V2Direction,
   args: BuildTenantSpuV2Args,
-): Record<string, unknown> {
+) {
   const { product, detail, targetDetail, targetSpuId, childSkuMap, frontCategoryIdRemap } = args;
   const channelList = detail.spuChannelInfoList ?? [];
   const ch100 = channelList.find((c) => c.channelId === 100);
@@ -1468,7 +1539,7 @@ function buildTenantSpuV2(
   });
 
   // ---- 顶层 tenantSpu ----
-  const base: Record<string, unknown> = {
+  const base: Record<string, unknown> & { storeFrontCategoryList: typeof storeFrontCategoryList } = {
     tenantId:
       direction === 'create'
         ? 0
@@ -2296,6 +2367,8 @@ interface StoreDetailResp {
   code: number;
   msg?: string;
   data?: {
+    storeId?: string | number;
+    spuId?: string | number;
     storeSkuList?: Array<{
       skuId: string | number;
       stock?: string | number | null;
@@ -2326,10 +2399,16 @@ export async function fetchStoreSkuInfo(payload: {
       },
       body: JSON.stringify({ storeId: Number(payload.shopId), spuId: String(payload.spuId) }),
     },
+    parseProductResponse,
   );
 
   if (resp?.code !== 0 || !resp.data) {
     throw new Error(`门店商品详情接口失败: ${resp?.msg ?? 'unknown'}`);
+  }
+  const { storeId, spuId, storeSkuList } = resp.data;
+  if ((storeId != null && String(storeId) !== String(payload.shopId)) ||
+      (spuId != null && String(spuId) !== String(payload.spuId))) {
+    throw new Error('返回的门店商品详情与请求的门店或 SPU ID 不一致。');
   }
 
   const parseNum = (v: string | number | null | undefined): number | undefined => {
@@ -2338,7 +2417,7 @@ export async function fetchStoreSkuInfo(payload: {
     return Number.isFinite(n) ? n : undefined;
   };
 
-  return (resp.data.storeSkuList ?? [])
+  return (storeSkuList ?? [])
     .filter((s) => s.skuId != null)
     .map((s) => {
       const channelPrices: Array<{ channelId: number; price: number }> = [];
@@ -2350,15 +2429,13 @@ export async function fetchStoreSkuInfo(payload: {
         seen.add(p.channelId);
         channelPrices.push({ channelId: p.channelId, price });
       }
-      const upcList: string[] = [];
-      for (const u of s.upcList ?? []) if (u) upcList.push(String(u));
-      if (s.upc && !upcList.includes(String(s.upc))) upcList.push(String(s.upc));
       return {
         skuId: s.skuId,
         stock: parseNum(s.stock),
         storePrice: parseNum(s.storePrice),
+        onlinePrice: parseNum(s.onlinePrice),
         channelPrices,
-        upcList,
+        upcList: readSkuUpcs(s),
       };
     });
 }

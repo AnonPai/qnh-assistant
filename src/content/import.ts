@@ -28,6 +28,7 @@ import type {
 } from '@shared/types';
 import type {
   FrontCategoryNode,
+  FrontCategoryTree,
   ImportConfirmMode,
   ImportMode,
   ProgressEvent,
@@ -47,6 +48,19 @@ import {
 } from './fs-stage';
 
 const log = createLogger('import');
+
+export class FrontCategoryMappingRequiredError extends Error {
+  constructor(message: string, readonly fileName: string) {
+    super(message);
+  }
+}
+
+export type RequestFrontCategoryAction = (info: {
+  paths: string[];
+  shopId: string | number;
+  canCreate: boolean;
+  signal?: AbortSignal;
+}) => Promise<'create' | 'map' | null>;
 
 /**
  * 解析"探针店":部分接口(创建商品 store/create、上传图片、商品列表/详情、店内分类树)
@@ -108,6 +122,7 @@ interface RunImportArgs {
    * 用户编辑好后下次再传。文件格式见 docs(以 # 开头的为注释,空目标列视为未填)。
    */
   frontCategoryMappingFile?: File | null;
+  requestFrontCategoryAction?: RequestFrontCategoryAction;
   /** 手动模式必须提供;UI 层弹确认框,返回用户决定 */
   requestConfirm?: RequestConfirm;
   cancelFlag: { cancelled: boolean; controller?: AbortController };
@@ -124,6 +139,7 @@ export async function runImport({
   syncImages = true,
   updateOnNameMatch = true,
   frontCategoryMappingFile,
+  requestFrontCategoryAction,
   requestConfirm,
   cancelFlag,
   onProgress,
@@ -211,13 +227,12 @@ export async function runImport({
   // 用导出包里所有商品引用的店内分类 namePath,跟目标店的店内分类树匹配。
   // 缺失项处理:
   //   1) 如果用户提供了映射文件,先按文件里的"源 path → 目标 path"覆盖一遍;
-  //   2) 仍有缺失 → 把"已自动匹配 + 缺失"的全量清单写到源目录,抛错让用户人工补齐
+  //   2) 仍有缺失 → 等待用户选择新增分类或生成映射文件
   onProgress({
     kind: 'import',
-    phase: 'parse',
-    current: 1,
-    total: 1,
-    message: '校验店内分类',
+    phase: 'category',
+    message: '正在校验店内分类…',
+    loading: true,
   });
   log.info('开始校验目标店「店内分类」…');
   const userOverrides = frontCategoryMappingFile
@@ -230,9 +245,12 @@ export async function runImport({
     await validateFrontCategories(
       callInjected,
       products,
-      probeShopId,
+      { shopId: probeShopId, storeGroupId: store ? Number(probeShopId) : undefined },
       userOverrides,
       sourceDir,
+      requestFrontCategoryAction,
+      cancelFlag,
+      onProgress,
     );
   log.info(
     `店内分类映射就绪:ID ${Object.keys(frontCategoryIdRemap).length} 条,` +
@@ -551,13 +569,6 @@ export async function runImport({
         });
         resultStatus = 'updated';
       } else {
-        const purchasePrice = store?.purchaseUnitPrice;
-        const specs = ((spu.raw?.detail as { skus?: Array<{ specName?: string; saleUnit?: string }> } | undefined)?.skus ?? [])
-          .map(s => ({ spec: s.specName ?? '', saleUnit: s.saleUnit ?? '' }));
-        if (purchasePrice != null && (!Number.isFinite(purchasePrice) || purchasePrice <= 0 ||
-            !specs.length || specs.some(s => !s.spec || !s.saleUnit) || new Set(specs.map(s => s.spec)).size !== specs.length)) {
-          throw new Error('采购配置需要有效单价、各 SKU 的销售单位及唯一规格名');
-        }
         targetSpuId = await callInjected<string | number>({
           type: 'CREATE_PRODUCT',
           payload: {
@@ -573,11 +584,10 @@ export async function runImport({
         if (store) {
           createdStoreSpuId = targetSpuId;
           matchedForFallback = { spuId: targetSpuId, reason: '门店已新建' };
-        }
-        if (store) {
           if (cancelFlag.cancelled) throw new Error('任务已取消，采购配置尚未提交');
+          const rawSkus = (spu.raw?.detail as { skus?: Array<{ specName?: string }> } | undefined)?.skus ?? [];
           await callInjected({ type: 'SET_NEW_STORE_PURCHASE', payload: {
-            shopId: probeShopId, targetSpuId, unitPrice: purchasePrice, specs,
+            shopId: probeShopId, targetSpuId, specs: rawSkus.map(sku => sku.specName ?? ''),
           } });
         }
         resultStatus = 'success';
@@ -851,14 +861,74 @@ interface FrontCategoryResolveResult {
   pathRemap: Map<string, string>;
 }
 
+function indexFrontCategories(nodes: FrontCategoryNode[]): Map<string, FrontCategoryNode> {
+  const index = new Map<string, FrontCategoryNode>();
+  const walk = (level: FrontCategoryNode[], parent: string[]) => {
+    for (const category of level) {
+      const path = [...parent, category.name];
+      index.set(path.join('/'), category);
+      if (category.children?.length) walk(category.children, path);
+    }
+  };
+  walk(nodes, []);
+  return index;
+}
+
+async function createMissingFrontCategories(
+  callInjected: CallInjected,
+  shopId: string | number,
+  storeGroupId: number,
+  paths: string[][],
+  cancelFlag: RunImportArgs['cancelFlag'],
+  report: (message: string) => void,
+) {
+  const readGroup = async () => indexFrontCategories((await callInjected<FrontCategoryTree>({
+    type: 'FETCH_FRONT_CATEGORY_TREE', payload: { shopId, storeGroupId },
+  })).categories);
+  let existing: Map<string, FrontCategoryNode>;
+  report('正在查询目标分类分组…');
+  try {
+    existing = await readGroup();
+  } catch (cause) {
+    const detail = cause instanceof Error ? cause.message : String(cause);
+    throw new Error(`无法查询目标分类分组 ${storeGroupId}。${detail}`, { cause });
+  }
+  for (const segments of paths) {
+    for (let level = 0; level < segments.length; level++) {
+      if (cancelFlag.cancelled) throw new Error('已取消');
+      const path = segments.slice(0, level + 1).join('/');
+      if (existing.has(path)) continue;
+      const parentId = level === 0 ? '0' : existing.get(segments.slice(0, level).join('/'))?.categoryId;
+      if (!parentId) throw new Error(`找不到「${path}」的父级分类。`);
+      let creationError: unknown;
+      report(`正在创建${level === 0 ? '一级' : '二级'}分类「${path}」…`);
+      try {
+        await callInjected({ type: 'CREATE_FRONT_CATEGORY', payload: {
+          storeGroupId, parentCategoryId: parentId, name: segments[level],
+        } });
+      } catch (error) {
+        creationError = error;
+      }
+      // 重新读取真实 ID；如果已被其他操作建好，也可以继续。
+      if (cancelFlag.cancelled) throw new Error('已取消');
+      report(creationError ? `正在回查「${path}」的创建结果…` : `正在确认分类「${path}」…`);
+      existing = await readGroup();
+      if (!existing.has(path)) {
+        const reason = creationError instanceof Error ? creationError.message : '分类树中还查不到该分类。';
+        throw new Error(`无法确认「${path}」已新增。${reason}`, { cause: creationError });
+      }
+    }
+  }
+  return existing;
+}
+
 /**
  * 跨租户导入前的"店内分类"校验:
  *   - 收集导出包里所有商品引用到的店内分类(name path + 源 ID)
  *   - 拉一次目标租户的店内分类树
  *   - 优先按完整名称路径(如 "饮料饮品/功能饮料")在目标树里直接匹配
  *   - 仍找不到的,看用户提供的映射文件里有没有"源 path → 目标 path"的覆盖
- *   - 任何一个最终找不到 → 把"已自动匹配 + 缺失"的清单写到源目录,
- *     抛错让用户编辑后下次重传(不上传任何图,流程在这里就终止)
+ *   - 仍有缺失时由用户选择新增分类，或打开源目录的映射文件
  *   - 全部命中 → 返回"源 ID → 目标 ID" + "源 path → 目标 path"两张映射表
  *
  * 这样可以避免"开始上传媒体之后才发现分类不存在"的尴尬。
@@ -866,10 +936,14 @@ interface FrontCategoryResolveResult {
 async function validateFrontCategories(
   callInjected: CallInjected,
   products: ProductSpu[],
-  targetShopId: string | number,
+  target: { shopId: string | number; storeGroupId?: number },
   userOverrides: Map<string, string>,
   sourceDir: FileSystemDirectoryHandle,
+  requestAction: RequestFrontCategoryAction | undefined,
+  cancelFlag: RunImportArgs['cancelFlag'],
+  onProgress: RunImportArgs['onProgress'],
 ): Promise<FrontCategoryResolveResult> {
+  const report = (message: string, loading = true) => onProgress({ kind: 'import', phase: 'category', message, loading });
   // 1) 收集源端用到的店内分类 (name path → 源 ID 集合)
   type SourceRef = { sourceId: string; namePath: string[] };
   const refs: SourceRef[] = [];
@@ -898,26 +972,16 @@ async function validateFrontCategories(
   if (refs.length === 0) return { idRemap: {}, pathRemap: new Map() };
 
   // 2) 拉目标店内分类树
-  let tree: FrontCategoryNode[];
+  report('正在读取目标店内分类…');
+  let tree: FrontCategoryTree;
   try {
-    tree = await callInjected<FrontCategoryNode[]>({
-      type: 'FETCH_FRONT_CATEGORY_TREE',
-      payload: { shopId: targetShopId },
-    });
+    tree = await callInjected<FrontCategoryTree>({ type: 'FETCH_FRONT_CATEGORY_TREE', payload: target });
   } catch (e) {
-    throw new Error(`无法获取目标店「店内分类」: ${(e as Error).message}`);
+    throw new Error(`无法获取目标店「店内分类」: ${(e as Error).message}`, { cause: e });
   }
 
   // 3) 按 name path 索引:Map<"a/b/c", FrontCategoryNode>
-  const byPath = new Map<string, FrontCategoryNode>();
-  const walk = (nodes: FrontCategoryNode[], parentPath: string[]) => {
-    for (const n of nodes) {
-      const path = [...parentPath, n.name];
-      byPath.set(path.join('/'), n);
-      if (n.children?.length) walk(n.children, path);
-    }
-  };
-  walk(tree, []);
+  let byPath = indexFrontCategories(tree.categories);
 
   // 4) 解析每个源 path:同名匹配优先,失败再查用户映射文件,再失败计入缺失
   type ResolveResult =
@@ -939,10 +1003,48 @@ async function validateFrontCategories(
   };
 
   // 4.1) 同一 namePath 可能对应多个源 ID(不同店重复用),只解一次
-  const resolved = new Map<string, ResolveResult>();
-  for (const r of refs) {
-    const key = r.namePath.join('/');
-    if (!resolved.has(key)) resolved.set(key, resolveOne(key));
+  const paths = new Map(refs.map(ref => [ref.namePath.join('/'), ref.namePath]));
+  const resolveAll = () => new Map([...paths.keys()].map(key => [key, resolveOne(key)]));
+  const unresolved = (resolved: Map<string, ResolveResult>) => [...resolved].filter(([, result]) =>
+    result.status === 'missing' || result.status === 'mapped-missing').map(([key]) => key);
+  let resolved = resolveAll();
+  const missingPaths = unresolved(resolved);
+  if (missingPaths.length && requestAction) {
+    const sourcePaths = missingPaths.map(path => paths.get(path)!);
+    const canCreate = sourcePaths.every(path => path.length <= 2);
+    if (cancelFlag.cancelled) throw new Error('已取消');
+    report('请选择新增分类或映射到已有分类。', false);
+    const action = await requestAction({ paths: missingPaths, shopId: target.shopId,
+      canCreate, signal: cancelFlag.controller?.signal });
+    if (!action || cancelFlag.cancelled) throw new Error('已取消');
+    if (action === 'create') {
+      if (!canCreate) throw new Error('自动新增支持一级和二级分类，请将更深层的分类映射到已有分类。');
+      report('正在查询目标门店关联分类…');
+      let targetStore: { storeId: number };
+      try {
+        targetStore = await callInjected<{ storeId: number }>({
+          type: 'FETCH_STORE_RELATION_CATEGORY', payload: { shopId: target.shopId },
+        });
+      } catch (cause) {
+        const detail = cause instanceof Error ? cause.message : String(cause);
+        throw new Error(`无法查询目标门店关联分类。${detail}`, { cause });
+      }
+      if (cancelFlag.cancelled) throw new Error('已取消');
+      const verified = await createMissingFrontCategories(callInjected, target.shopId, targetStore.storeId, sourcePaths,
+        cancelFlag, report);
+      // 门店创建的分类由该门店分组查询返回，通用分类树不会返回这些 ID。
+      if (target.storeGroupId != null) {
+        byPath = verified;
+      } else {
+        for (const path of missingPaths) {
+          const category = verified.get(path);
+          if (category) byPath.set(path, category);
+        }
+      }
+      resolved = resolveAll();
+      const unconfirmed = unresolved(resolved);
+      if (unconfirmed.length) throw new Error(`目标门店分类「${unconfirmed[0]}」在校验期间已变化，请重新导入。`);
+    }
   }
 
   // 5) 按解析结果分桶
@@ -987,20 +1089,17 @@ async function validateFrontCategories(
     mappedMissing,
     targetPaths: [...byPath.keys()].sort(),
   });
+  const totalMissing = missing.length + mappedMissing.length;
+  const missingMessage = `目标店缺少 ${totalMissing} 项店内分类`;
+  const relPath = `${sourceDir.name}/${fileName}`;
+  report('正在生成店内分类映射文件…');
   try {
     await writeTextFile(sourceDir, fileName, '\uFEFF' + text);
     log.warn(`已写入分类映射模板: ${fileName}`);
   } catch (e) {
-    log.warn('写入分类映射模板失败', e);
+    throw new Error(`${missingMessage}，无法写入 ${relPath}。${(e as Error).message}`, { cause: e });
   }
-
-  const lines: string[] = [];
-  const totalMissing = missing.length + mappedMissing.length;
-  // 浏览器 File System Access API 不暴露目录的硬盘绝对路径,
-  // 只能给到"目录名 / 文件名",用户对照打开即可。
-  const relPath = `${sourceDir.name}/${fileName}`;
-  lines.push(`目标店缺少 ${totalMissing} 项店内分类,请在 ${relPath} 里维护后重新导入。`);
-  throw new Error(lines.join('\n'));
+  throw new FrontCategoryMappingRequiredError(`${missingMessage}，请在 ${relPath} 里维护后重新导入。`, fileName);
 }
 
 /**

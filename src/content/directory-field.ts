@@ -1,8 +1,9 @@
 import { directoryPermission, ensurePermission, pickDirectory, MANIFEST_FILE, PROGRESS_FILE } from './fs-stage';
-import { lastDirectory, rememberDirectory, type DirectoryTask } from './recent-directory';
+import { loadWorkspaceRoot, saveWorkspaceRoot } from './recent-directory';
 
 type Directory = FileSystemDirectoryHandle;
 type MovableDirectory = Directory & { move?: (name: string) => Promise<void> };
+type DirectoryTask = 'export' | 'import' | 'sync';
 
 export const directoryMarkup = (label: string) => `
   <section aria-label="${label}">
@@ -83,7 +84,6 @@ export function bindDirectory<T>(
   let renaming: MovableDirectory | undefined;
   let systemRename = false;
   let siblings: Directory[] = [];
-  let recentTasks: DirectoryTask[] = [];
   const exporting = task === 'export';
   const mode = task === 'sync' ? 'read' : 'readwrite';
   let main: Directory | undefined;
@@ -112,7 +112,7 @@ export function bindDirectory<T>(
   }
 
   // 一次只执行一个目录操作，防止双击创建或旧目录的结果覆盖刚选的目录。
-  async function run(action: () => Promise<void>) {
+  async function run(action: () => Promise<void> | void) {
     if (busy || !root.host.isConnected) return;
     busy = true;
     browse.disabled = reconnect.disabled = newName.disabled = browser.inert = true;
@@ -134,7 +134,7 @@ export function bindDirectory<T>(
     }
   }
 
-  function folderButton(label: string, action: () => Promise<void>) {
+  function folderButton(label: string, action: () => Promise<void> | void) {
     const button = document.createElement('button');
     button.type = 'button';
     button.textContent = label;
@@ -147,7 +147,6 @@ export function bindDirectory<T>(
     editor.hidden = true;
     renaming = undefined;
     systemRename = false;
-    recentTasks = [];
     newName.value = '';
   }
 
@@ -161,14 +160,10 @@ export function bindDirectory<T>(
     requestAnimationFrame(() => { if (!editor.hidden) (systemRename ? create : newName).focus(); });
   }
 
-  async function edit(folder?: MovableDirectory) {
+  function edit(folder?: MovableDirectory) {
     closeEditor();
     renaming = folder;
     if (folder) {
-      for (const taskKey of ['export', 'import', 'sync'] as const) {
-        const remembered = await lastDirectory(taskKey).catch(() => undefined);
-        if (remembered && await folder.isSameEntry(remembered).catch(() => false)) recentTasks.push(taskKey);
-      }
       systemRename = typeof folder.move !== 'function';
       newName.value = folder.name;
     }
@@ -186,7 +181,6 @@ export function bindDirectory<T>(
     for (const button of buttons) {
       if (button.textContent === dir.name) button.setAttribute('aria-pressed', 'true');
     }
-    if (!await rememberDirectory(task, dir)) notice('当前仅能在本标签页记住所选目录。');
   }
 
   async function showProjects(dir: Directory, preferredName?: string) {
@@ -245,12 +239,10 @@ export function bindDirectory<T>(
       }
     }
     if (saveRoot) {
-      if (!await rememberDirectory('workspace-root', dir)) notice('当前仅能在本标签页记住主目录。');
+      if (!await saveWorkspaceRoot(dir)) notice('当前仅能在本标签页记住主目录。');
       saveRoot = false;
     }
-    const last = await lastDirectory(task).catch(() => undefined);
-    const relative = last && await dir.resolve(last).catch(() => null);
-    await showProjects(dir, relative?.length === 1 ? relative[0] : undefined);
+    await showProjects(dir);
   }
 
   browse.onclick = () => void run(async () => {
@@ -323,7 +315,6 @@ export function bindDirectory<T>(
       }
       child = await parent.getDirectoryHandle(childName, { create: !renaming });
     }
-    for (const key of recentTasks) await rememberDirectory(key, child);
     let preferred = previous;
     if (oldName ? previous?.name === oldName : exporting) preferred = child;
     await showProjects(parent, preferred?.name);
@@ -332,7 +323,7 @@ export function bindDirectory<T>(
 
   // 等宿主表单完成初始化，恢复时只查询授权状态。
   queueMicrotask(() => void run(async () => {
-    const dir = await lastDirectory('workspace-root');
+    const dir = await loadWorkspaceRoot();
     if (dir) await openMain(dir, 'restore');
   }));
 

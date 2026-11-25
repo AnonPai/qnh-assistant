@@ -32,6 +32,8 @@ export interface SpecOption {
 export interface ProductSku {
   /** 门店线下价，旧导出包没有此字段。 */
   storePrice?: number;
+  /** 源门店线上零售价，旧导出包可能未记录。 */
+  onlinePrice?: number;
   /** 源系统 SKU id,仅用于 manifest 调试,不传给目标账号 */
   sourceSkuId?: string | number;
   /** 规格组合 */

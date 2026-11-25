@@ -128,6 +128,15 @@ function ImportProgressView({
 }: {
   progress: Extract<ProgressEvent, { kind: 'import' }>;
 }) {
+  if (progress.phase === 'category') {
+    return (
+      <div className="progress" role="status">
+        <div className="progress__stage">店内分类</div>
+        <div className="progress__detail" title={progress.message}>{progress.message}</div>
+        {progress.loading && <progress aria-label="店内分类处理中" style={{ width: '100%' }} />}
+      </div>
+    );
+  }
   const pCur =
     progress.productCurrent ??
     (progress.phase === 'product' ? progress.current : 0);

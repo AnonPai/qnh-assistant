@@ -24,8 +24,7 @@ import type {
   MediaAsset,
   ProductSpu,
 } from '@shared/types';
-import type { ProgressEvent, ShopInfo } from '@shared/messaging';
-import type { StoreSkuInfo } from '@shared/messaging';
+import type { ProductListPage, ProductListSku, ProgressEvent, ShopInfo, StoreSkuInfo } from '@shared/messaging';
 import type { CallInjected } from './index';
 import {
   ExportProgressFile,
@@ -50,20 +49,19 @@ interface RunExportArgs {
   spuNameKeyword?: string;
   /**
    * 显式指定要导出的 SPU id 列表(精确筛选 / 冒烟测试 / 灰度);
-   * 设置后会跳过 FETCH_PRODUCT_LIST 分页,直接拿这份清单进队列。
+   * 设置后会跳过 FETCH_PRODUCT_LIST 分页,逐个确认清单中的商品属于所选门店。
    * 子商品(组合装的 childSkuList)依然会被自动发现并入队。
    * 优先级高于 spuNameKeyword / skuUpcList —— 一旦给了清单,其它列表筛选条件忽略。
    */
   spuIdAllowlist?: Array<string | number>;
   /**
    * 商品条码筛选:UPC / 条码列表。只导出"任一 SKU 命中给定条码"的 SPU。
-   * best-effort 透传给后端的同时,会在拿到门店列表后按 item.upcList 本地兜底过滤
-   * (后端若忽略该参数,本地过滤仍能保证结果正确)。
+   * 按门店规格的条码精确匹配,列表缺少数据时查门店详情。
    */
   skuUpcList?: string[];
   /**
    * SKU id 筛选:只导出"任一 SKU 命中给定 skuId"的 SPU。
-   * best-effort 透传给后端的同时,会在拿到门店列表后按 item.skuIdList 本地兜底过滤。
+   * 同时指定条码时,要求同一 SKU 命中两项条件。
    */
   skuIdList?: Array<string | number>;
   /** 是否一并导出图片(默认 true);关闭后图片字段保留原始 CDN URL,不会下载到本地 */
@@ -77,11 +75,6 @@ interface RunExportArgs {
   callInjected: CallInjected;
 }
 
-interface ProductListPage {
-  list: Array<{ spuId: string | number; name: string; upcList?: string[]; skuIdList?: string[] }>;
-  total: number;
-}
-
 /** 商品列表 / 队列里每一项的形态(和 ExportProgressFile.queue 等价) */
 type QueueItem = ExportProgressFile['queue'][number];
 
@@ -90,12 +83,16 @@ type ExportFilters = Pick<RunExportArgs, 'limitCount' | 'spuIdAllowlist' | 'spuN
 /** 同一组 ID 换序仍可续传。显式 SPU 清单优先于列表筛选。 */
 export function exportFilterKey(filters: ExportFilters): string {
   const sorted = (ids?: Array<string | number>) => [...new Set((ids ?? []).map(String))].sort();
-  if (filters.spuIdAllowlist?.length) return JSON.stringify({ spu: sorted(filters.spuIdAllowlist) });
+  if (filters.spuIdAllowlist?.length) return JSON.stringify({ spu: sorted(filters.spuIdAllowlist), version: 3 });
   const name = filters.spuNameKeyword?.trim() ?? '';
   const upcs = sorted(filters.skuUpcList);
   const skus = sorted(filters.skuIdList);
   const limit = Math.max(0, filters.limitCount ?? 0);
-  return name || upcs.length || skus.length || limit ? JSON.stringify({ name, upcs, skus, limit }) : '';
+  // 旧筛选队列可能包含未核对的商品，按当前规则重新生成。
+  const version = name || upcs.length ? 3 : undefined;
+  const skuIdFilterVersion = skus.length && !version ? 2 : undefined;
+  return name || upcs.length || skus.length || limit
+    ? JSON.stringify({ name, upcs, skus, limit, skuIdFilterVersion, version }) : '';
 }
 
 export async function runExport({
@@ -115,12 +112,18 @@ export async function runExport({
 }: RunExportArgs) {
   const limited = typeof limitCount === 'number' && limitCount > 0;
   const useAllowlist = !!spuIdAllowlist && spuIdAllowlist.length > 0;
+  const nameKeyword = spuNameKeyword?.trim();
+  const nameFilter = nameKeyword?.toLowerCase();
   // 商品条码筛选:规整成去重后的非空集合,供本地兜底过滤
   const upcFilter = normalizeUpcFilter(skuUpcList);
   const useUpcFilter = upcFilter.size > 0;
   // SKU id 筛选:同样规整成去重后的非空集合
   const skuIdFilter = normalizeUpcFilter(skuIdList?.map(String));
   const useSkuIdFilter = skuIdFilter.size > 0;
+  const useSkuFilter = useSkuIdFilter || useUpcFilter;
+  const matchesSkuId = (sku: ProductListSku) => !useSkuIdFilter || skuIdFilter.has(normalizeUpc(sku.skuId));
+  const matchesSku = (sku: ProductListSku) => matchesSkuId(sku) &&
+    (!useUpcFilter || sku.upcList.some(upc => upcFilter.has(normalizeUpc(upc))));
   const filterKey = exportFilterKey({ limitCount, spuNameKeyword, spuIdAllowlist, skuUpcList, skuIdList });
 
   // ---- 0) 准备目录与续传状态 ----
@@ -157,6 +160,7 @@ export async function runExport({
   // ---- 3) 商品列表 ----
   const fetched = new Set<string>(resume?.doneSpuIds ?? []);
   const queue: QueueItem[] = resume ? [...resume.queue] : [];
+  const matchedStoreSkus = new Map<string, StoreSkuInfo[]>();
   let listFinished = resume?.listFinished ?? false;
   const saveProgress = () => persistProgress({
     targetDir, sourceShopId, sourceShopName, includeVideo, includeImages, filterKey,
@@ -189,7 +193,7 @@ export async function runExport({
       let pageNo = 1;
       const pageSize = limited ? Math.min(limitCount!, 50) : 50;
       let scanned = 0;
-      const targetList: Array<{ spuId: string | number; name: string; upcList?: string[]; skuIdList?: string[] }> = [];
+      const targetList: QueueItem[] = [];
       while (!cancelFlag.cancelled) {
         const page = await callInjected<ProductListPage>({
           type: 'FETCH_PRODUCT_LIST',
@@ -197,7 +201,7 @@ export async function runExport({
             shopId: sourceShopId,
             pageNo,
             pageSize,
-            spuName: spuNameKeyword,
+            spuName: nameKeyword || undefined,
             upcList: useUpcFilter ? [...upcFilter] : undefined,
             skuIdList: useSkuIdFilter ? [...skuIdFilter] : undefined,
             scope: 'store',
@@ -205,14 +209,22 @@ export async function runExport({
         });
         scanned += page.list.length;
         for (const item of page.list) {
-          if (useUpcFilter && !(item.upcList ?? []).some(upc => upcFilter.has(normalizeUpc(upc)))) continue;
-          if (useSkuIdFilter && !(item.skuIdList ?? []).some(id => skuIdFilter.has(normalizeUpc(id)))) continue;
-          targetList.push(item);
+          if (cancelFlag.cancelled) break;
+          if (nameFilter && !item.name.toLowerCase().includes(nameFilter)) continue;
+          if (useSkuFilter && !item.skus.some(matchesSku)) {
+            const missingSkuId = useSkuIdFilter && item.skus.some(sku => sku.skuId == null);
+            const missingUpc = useUpcFilter && item.skus.some(sku => matchesSkuId(sku) && !sku.upcList.some(normalizeUpc));
+            if (item.skus.length > 0 && !missingSkuId && !missingUpc) continue;
+            const storeSkus = await fetchStoreSkus(sourceShopId, item.spuId, callInjected);
+            if (!storeSkus.some(matchesSku)) continue;
+            matchedStoreSkus.set(String(item.spuId), storeSkus);
+          }
+          targetList.push({ spuId: item.spuId, name: item.name, reason: 'list' });
           if (limited && targetList.length >= limitCount!) break;
         }
         onProgress({ kind: 'export', phase: 'list', current: scanned, total: page.total });
         if (limited && targetList.length >= limitCount!) break;
-        if (page.list.length === 0 || (page.total > 0 && scanned >= page.total)) break;
+        if (cancelFlag.cancelled || page.list.length === 0 || (page.total > 0 && scanned >= page.total)) break;
         pageNo++;
         await jitter(...THROTTLE.EXPORT_LIST_PAGE);
       }
@@ -222,9 +234,10 @@ export async function runExport({
         throw new Error('已取消');
       }
       log.info(`已扫描 ${scanned} 个商品，本次选中 ${targetList.length} 个`);
-      queue.push(
-        ...targetList.map((it) => ({ spuId: it.spuId, name: it.name, reason: 'list' as const })),
-      );
+      if ((nameFilter || useSkuFilter) && targetList.length === 0) {
+        throw new Error('所选门店没有符合筛选条件的商品，请核对筛选条件。');
+      }
+      queue.push(...targetList);
       listFinished = true;
 
       await saveProgress();
@@ -265,6 +278,18 @@ export async function runExport({
       productTotal,
     });
 
+    let storeSkus = matchedStoreSkus.get(key);
+    if (useAllowlist && item.reason === 'list') {
+      const message = `无法确认 SPU ${key} 属于所选门店`;
+      try {
+        storeSkus = await fetchStoreSkus(sourceShopId, item.spuId, callInjected);
+      } catch (cause) {
+        const detail = cause instanceof Error ? cause.message : String(cause);
+        throw new Error(`${message}。${detail}`, { cause });
+      }
+      if (storeSkus.length === 0) throw new Error(`${message}。门店详情没有返回规格。`);
+    }
+
     let spu = await callInjected<ProductSpu>({
       type: 'FETCH_PRODUCT_DETAIL',
       payload: { shopId: sourceShopId, spuId: item.spuId },
@@ -272,7 +297,8 @@ export async function runExport({
 
     // 门店维度补充:库存 + 分渠道零售价(tenant/detail 拿不到这两类门店覆盖层数据)。
     // 失败不影响主流程 —— 拿不到就保持 stock/channelPrices 为空,同步阶段会按"跳过"处理。
-    await enrichWithStoreSkuInfo(spu, sourceShopId, callInjected);
+    await enrichWithStoreSkuInfo(spu, sourceShopId, callInjected, storeSkus);
+    matchedStoreSkus.delete(key);
 
     const allPending =
       (spu.raw?.__pendingMedia as Array<{ url: string; kind: 'image' | 'video'; ref: string }>) ?? [];
@@ -535,13 +561,10 @@ async function enrichWithStoreSkuInfo(
   spu: ProductSpu,
   sourceShopId: string | number,
   callInjected: CallInjected,
+  storeSkus?: StoreSkuInfo[],
 ): Promise<void> {
-  let storeSkus: StoreSkuInfo[];
   try {
-    storeSkus = await callInjected<StoreSkuInfo[]>({
-      type: 'FETCH_STORE_SKU_INFO',
-      payload: { shopId: sourceShopId, spuId: spu.sourceSpuId },
-    });
+    storeSkus ??= await fetchStoreSkus(sourceShopId, spu.sourceSpuId, callInjected);
   } catch (e) {
     log.warn(`门店库存/价格补充失败,跳过: spu=${spu.sourceSpuId}`, e);
     return;
@@ -564,8 +587,13 @@ async function enrichWithStoreSkuInfo(
     if (!info) continue;
     if (info.stock != null) sku.stock = info.stock;
     if (info.storePrice != null) sku.storePrice = info.storePrice;
+    if (info.onlinePrice != null) sku.onlinePrice = info.onlinePrice;
     if (info.channelPrices.length > 0) sku.channelPrices = info.channelPrices;
   }
+}
+
+function fetchStoreSkus(shopId: string | number, spuId: string | number, callInjected: CallInjected) {
+  return callInjected<StoreSkuInfo[]>({ type: 'FETCH_STORE_SKU_INFO', payload: { shopId, spuId } });
 }
 
 /** 收集组合装的子 SPU id */

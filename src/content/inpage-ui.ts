@@ -13,17 +13,18 @@
  * - 进度面板与确认弹窗用 Shadow DOM 包裹,样式与宿主页面隔离
  */
 
-import type { ProgressEvent } from '@shared/messaging';
+import { EXTENSION_REFRESH_MESSAGE, type ProgressEvent } from '@shared/messaging';
 import type { CategoryMapping } from '@shared/types';
 import {
   cancelCurrent,
   callInjected,
+  isExtensionContextActive,
   startExport,
   startImport,
   startSync,
   subscribeProgress,
 } from './index';
-import { openExportForm, openImportForm, openSyncForm } from './config-forms';
+import { openExportForm, openFrontCategoryAction, openFrontCategoryMappingEditor, openImportForm, openSyncForm } from './config-forms';
 
 const BTN_EXPORT_TEXT = '📦 导出本店商品';
 const BTN_IMPORT_TEXT = '📥 导入商品';
@@ -67,7 +68,6 @@ export function mountInPageUI() {
     });
   };
   tryMount();
-
   const obs = new MutationObserver(tryMount);
   obs.observe(document.documentElement, { subtree: true, childList: true });
 
@@ -315,11 +315,12 @@ async function onImportClick(store = false) {
       result.frontCategoryMappingFile ? ` · 分类映射:${result.frontCategoryMappingFile.name}` : ''
     }`,
     tone: 'info',
+    importSourceDir: result.sourceDir,
   });
 
   const mapping: CategoryMapping = {};
-  await startImport({
-    store: result.shop && { shopId: result.shop.shopId, purchaseUnitPrice: result.purchaseUnitPrice },
+  const mappingError = await startImport({
+    store: result.shop && { shopId: result.shop.shopId },
     sourceDir: result.sourceDir,
     mapping,
     mode: result.mode,
@@ -327,8 +328,19 @@ async function onImportClick(store = false) {
     syncImages: result.syncImages,
     updateOnNameMatch: result.updateOnNameMatch,
     frontCategoryMappingFile: result.frontCategoryMappingFile,
+    requestFrontCategoryAction: openFrontCategoryAction,
     requestConfirm: result.confirmMode === 'manual' ? requestImportConfirm : undefined,
   });
+  if (mappingError) await editImportMapping(result.sourceDir, mappingError.fileName);
+}
+
+async function editImportMapping(dir: FileSystemDirectoryHandle, fileName: string) {
+  if (!await openFrontCategoryMappingEditor(dir, fileName)) return;
+  const root = ensurePanel();
+  root.querySelector<HTMLElement>('.qnh-title')!.textContent = '店内分类映射已保存';
+  root.querySelector<HTMLElement>('.qnh-body')!.textContent =
+    `已保存到 ${dir.name}/${fileName}。重新导入时，在「店内分类映射文件」中选择它。`;
+  root.querySelector<HTMLElement>('.qnh-card')!.dataset.tone = 'info';
 }
 
 /**
@@ -354,6 +366,10 @@ async function clearStaleProgress(dir: FileSystemDirectoryHandle): Promise<void>
 let taskOpen = false;
 
 async function openTask(action: () => Promise<void>) {
+  if (!isExtensionContextActive()) {
+    showPanel({ title: '需要刷新页面', body: EXTENSION_REFRESH_MESSAGE, tone: 'error' });
+    return;
+  }
   if (taskOpen) {
     shadow?.querySelector('.qnh-card')?.classList.remove('qnh-hidden');
     return;
@@ -378,6 +394,7 @@ interface PanelInit {
   title: string;
   body?: string;
   tone?: 'info' | 'success' | 'error';
+  importSourceDir?: FileSystemDirectoryHandle;
 }
 
 let shadowHost: HTMLDivElement | null = null;
@@ -402,11 +419,15 @@ function showPanel(init: PanelInit) {
   const titleEl = root.querySelector('.qnh-title') as HTMLElement;
   const bodyEl = root.querySelector('.qnh-body') as HTMLElement;
   const cardEl = root.querySelector('.qnh-card') as HTMLElement;
+  const editMapping = root.querySelector<HTMLButtonElement>('.qnh-edit-mapping')!;
 
   titleEl.textContent = init.title;
   bodyEl.textContent = init.body ?? '';
   cardEl.dataset.tone = init.tone ?? 'info';
+  delete cardEl.dataset.category;
   cardEl.classList.remove('qnh-hidden');
+  editMapping.hidden = true;
+  editMapping.onclick = null;
 
   root.querySelector<HTMLElement>('.qnh-bar > div')!.style.width = '0%';
   // 新任务开启:清空日志列表
@@ -414,7 +435,14 @@ function showPanel(init: PanelInit) {
 
   // 进度订阅
   if (unsub) unsub();
-  unsub = subscribeProgress((e) => onProgress(root, e));
+  unsub = subscribeProgress((e) => {
+    onProgress(root, e);
+    const dir = init.importSourceDir;
+    if (e.kind !== 'error' || !e.mappingFileName || !dir) return;
+    const fileName = e.mappingFileName;
+    editMapping.hidden = false;
+    editMapping.onclick = () => void openTask(() => editImportMapping(dir, fileName));
+  });
 }
 
 function onProgress(root: ShadowRoot, e: ProgressEvent) {
@@ -427,6 +455,16 @@ function onProgress(root: ShadowRoot, e: ProgressEvent) {
     appendPanelLog(root, e);
     return;
   }
+
+  const wasHandlingCategories = cardEl.dataset.category != null;
+  if (e.kind === 'import' && e.phase === 'category') {
+    titleEl.textContent = '导入中 · 店内分类';
+    bodyEl.textContent = e.message;
+    cardEl.dataset.tone = 'info';
+    cardEl.dataset.category = e.loading ? 'loading' : 'waiting';
+    return;
+  }
+  delete cardEl.dataset.category;
 
   if (e.kind === 'export') {
     const phaseLabel = {
@@ -523,7 +561,8 @@ function onProgress(root: ShadowRoot, e: ProgressEvent) {
     barEl.style.width = '100%';
   } else if (e.kind === 'error') {
     const cancelled = e.message === '已取消';
-    titleEl.textContent = cancelled ? '任务已取消' : '出错了';
+    titleEl.textContent = cancelled ? '任务已取消' : e.mappingFileName ? '需要维护店内分类映射' :
+      wasHandlingCategories ? '店内分类处理失败' : '出错了';
     bodyEl.textContent = e.message;
     cardEl.dataset.tone = cancelled ? 'info' : 'error';
   }
@@ -616,7 +655,17 @@ function panelHTML(): string {
       .qnh-close:hover { color: #1f1f1f; }
 
       .qnh-content { padding: 10px 12px 8px; }
+      .qnh-status-row { display: flex; align-items: flex-start; gap: 8px; }
       .qnh-body { font-size: 12px; color: #555; min-height: 18px; word-break: break-all; }
+      .qnh-spinner {
+        display: none; flex: none; width: 12px; height: 12px; margin-top: 3px;
+        border: 2px solid #d7e1df; border-top-color: #12675b; border-radius: 50%;
+        animation: qnh-spin .8s linear infinite;
+      }
+      .qnh-card[data-category="loading"] .qnh-spinner { display: block; }
+      .qnh-card[data-category] .qnh-bar { display: none; }
+      @keyframes qnh-spin { to { transform: rotate(360deg); } }
+      @media (prefers-reduced-motion: reduce) { .qnh-spinner { animation: none; } }
       .qnh-bar {
         margin-top: 8px;
         height: 6px;
@@ -680,6 +729,13 @@ function panelHTML(): string {
         font-size: 12px; border: 1px solid #d9d9d9;
       }
       .qnh-btn:hover { background: #fafafa; }
+      .qnh-btn.qnh-edit-mapping {
+        display: inline-block; margin-top: 8px; color: #12675b; border-color: #a8c6bb;
+        background: #f2f8f5; font-weight: 600;
+      }
+      .qnh-btn.qnh-edit-mapping:hover { background: #e1f1e9; }
+      .qnh-btn.qnh-edit-mapping:focus-visible { outline: 2px solid #188575; outline-offset: 2px; }
+      .qnh-btn.qnh-edit-mapping[hidden] { display: none; }
     </style>
     <div class="qnh-card qnh-hidden" data-tone="info">
       <div class="qnh-head">
@@ -687,7 +743,11 @@ function panelHTML(): string {
         <button class="qnh-close" title="关闭">×</button>
       </div>
       <div class="qnh-content">
-        <div class="qnh-body"></div>
+        <div class="qnh-status-row">
+          <span class="qnh-spinner" aria-hidden="true"></span>
+          <div class="qnh-body" role="status"></div>
+        </div>
+        <button type="button" class="qnh-btn qnh-edit-mapping" hidden>立即打开</button>
         <div class="qnh-bar"><div></div></div>
       </div>
       <div class="qnh-logs qnh-hidden">

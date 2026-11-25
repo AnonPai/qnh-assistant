@@ -38,7 +38,7 @@ input:disabled { background: #ecf0ef; }
 .shop-fields { display: grid; grid-template-columns: 2fr 3fr; gap: 8px; }
 button { cursor: pointer; flex-shrink: 0; }
 button:hover { background: #edf5f2; }
-button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-visible { outline: 2px solid #188575; outline-offset: 2px; }
+button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-visible, textarea:focus-visible { outline: 2px solid #188575; outline-offset: 2px; }
 .close { border: 0; font-size: 22px; line-height: 1; padding: 5px 8px; }
 .choice {
   border: 1px solid var(--line); border-radius: 8px; padding: 9px 11px;
@@ -88,6 +88,13 @@ footer .hint { flex: 1; margin: 0; overflow-wrap: anywhere; }
 .primary:disabled { background: #e5ece9; color: #60716a; border-color: #e5ece9; cursor: default; }
 .file-row { display: flex; gap: 6px; align-items: center; }
 .file-row input { min-width: 0; flex: 1; }
+.mapping-path { margin: 0 0 12px; color: #526762; overflow-wrap: anywhere; }
+.category-paths { max-height: 140px; overflow: auto; margin: 0 0 16px; padding-left: 20px; overflow-wrap: anywhere; }
+#mapping-text {
+  display: block; width: 100%; height: min(44vh, 360px); margin-top: 8px; padding: 10px;
+  resize: vertical; border: 1px solid #baccc7; border-radius: 7px; background: #f5f8f7; color: var(--ink);
+  font: 13px/1.55 ui-monospace, Consolas, "Microsoft YaHei", monospace;
+}
 @media (max-width: 520px) {
   header, main, footer { padding: 12px 14px; }
   .filter-grid, .choices, .shop-fields { grid-template-columns: 1fr; }

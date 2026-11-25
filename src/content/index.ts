@@ -13,6 +13,7 @@ import { createLogger } from '@shared/logger';
 import {
   BRIDGE_SOURCE_CONTENT,
   BRIDGE_SOURCE_INJECTED,
+  EXTENSION_REFRESH_MESSAGE,
   type InjectedCommand,
   type InjectedResponse,
   type PopupRequest,
@@ -20,13 +21,17 @@ import {
   type ProgressEvent,
 } from '@shared/messaging';
 import { runExport } from './export';
-import { runImport } from './import';
+import { FrontCategoryMappingRequiredError, runImport } from './import';
 import { runSync } from './sync';
 import { mountInPageUI, openInPageEntry } from './inpage-ui';
 
 const log = createLogger('content');
 
 /** ---------- 注入 page world 脚本 ---------- */
+export function isExtensionContextActive(): boolean {
+  try { return Boolean(chrome.runtime?.id); } catch { return false; }
+}
+
 function injectPageScript() {
   const url = chrome.runtime.getURL('injected.js');
   const s = document.createElement('script');
@@ -68,6 +73,7 @@ export type CallInjected = <T = unknown>(cmd: {
 }) => Promise<T>;
 
 export const callInjected: CallInjected = (cmd) => {
+  if (!isExtensionContextActive()) return Promise.reject(new Error(EXTENSION_REFRESH_MESSAGE));
   const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   return new Promise((resolve, reject) => {
     pending.set(id, { resolve: resolve as (v: unknown) => void, reject });
@@ -102,9 +108,12 @@ export function reportProgress(event: ProgressEvent) {
       log.warn('progress listener error', e);
     }
   }
-  chrome.runtime.sendMessage({ __channel: 'progress', event }).catch(() => {
-    /* background 可能短暂未就绪,忽略 */
-  });
+  if (!isExtensionContextActive()) return;
+  try {
+    void chrome.runtime.sendMessage({ __channel: 'progress', event }).catch(() => {});
+  } catch {
+    // 运行时可能在扩展更新时失效，本页的进度仍由上面的订阅器显示。
+  }
 }
 
 /** ---------- 任务执行(消息处理器与页面注入按钮共用) ---------- */
@@ -166,6 +175,7 @@ export function startImport(args: {
   updateOnNameMatch?: boolean;
   /** 可选:用户人工维护的「店内分类映射」文件 */
   frontCategoryMappingFile?: File | null;
+  requestFrontCategoryAction?: import('./import').RequestFrontCategoryAction;
   /** 手动模式必填:UI 层弹确认框,返回用户决定 */
   requestConfirm?: import('./import').RequestConfirm;
 }) {
@@ -179,13 +189,20 @@ export function startImport(args: {
     syncImages: args.syncImages ?? true,
     updateOnNameMatch: args.updateOnNameMatch ?? true,
     frontCategoryMappingFile: args.frontCategoryMappingFile,
+    requestFrontCategoryAction: args.requestFrontCategoryAction,
     requestConfirm: args.requestConfirm,
     cancelFlag,
     onProgress: reportProgress,
     callInjected,
   }).catch((e) => {
     log.error('import error', e);
-    reportProgress({ kind: 'error', message: String(e?.message ?? e) });
+    const mappingError = e instanceof FrontCategoryMappingRequiredError ? e : undefined;
+    reportProgress({
+      kind: 'error',
+      message: String(e?.message ?? e),
+      mappingFileName: mappingError?.fileName,
+    });
+    return mappingError;
   });
 }
 

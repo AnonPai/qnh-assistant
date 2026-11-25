@@ -21,6 +21,7 @@ export type { ImportSummary, SyncSummary } from './types';
 /** 消息源/目标标识 */
 export const BRIDGE_SOURCE_INJECTED = 'qnh-injected';
 export const BRIDGE_SOURCE_CONTENT = 'qnh-content';
+export const EXTENSION_REFRESH_MESSAGE = '扩展已更新，请刷新牵牛花页面后重试。';
 
 /** 导入模式 */
 export type ImportMode = 'full' | 'incremental';
@@ -64,6 +65,7 @@ export type ProgressEvent =
       productCurrent?: number;
       productTotal?: number;
     }
+  | { kind: 'import'; phase: 'category'; message: string; loading: boolean }
   | {
       /** 「同步库存 / 零售价」进度 */
       kind: 'sync';
@@ -89,7 +91,7 @@ export type ProgressEvent =
       text: string;
     }
   | { kind: 'done'; result: ExportResult | ImportSummary | SyncSummary }
-  | { kind: 'error'; message: string };
+  | { kind: 'error'; message: string; mappingFileName?: string };
 
 export interface ExportResult {
   manifest: ExportManifest;
@@ -106,7 +108,9 @@ export type InjectedCommand =
   /** 门店维度补充信息:某 SPU 下各 SKU 的门店库存 + 分渠道零售价(store/detail) */
   | { id: string; type: 'FETCH_STORE_SKU_INFO'; payload: { shopId: string | number; spuId: string | number } }
   | { id: string; type: 'FETCH_CATEGORY_TREE'; payload: { shopId: string | number } }
-  | { id: string; type: 'FETCH_FRONT_CATEGORY_TREE'; payload: { shopId: string | number } }
+  | { id: string; type: 'FETCH_FRONT_CATEGORY_TREE'; payload: { shopId: string | number; storeGroupId?: number } }
+  | { id: string; type: 'FETCH_STORE_RELATION_CATEGORY'; payload: { shopId: string | number } }
+  | { id: string; type: 'CREATE_FRONT_CATEGORY'; payload: { storeGroupId: number; parentCategoryId: string; name: string } }
   | { id: string; type: 'FETCH_SHOP_INFO' }
   | { id: string; type: 'UPLOAD_MEDIA'; payload: { shopId: string | number; kind: 'image' | 'video'; mime: string; bytesBase64: string } }
   | { id: string; type: 'CREATE_PRODUCT'; payload: { scope?: 'store'; shopId: string | number; product: ProductSpu; mediaIdMap: Record<string, UploadedMedia>; targetCategoryPath: Array<string | number>; childSkuMap?: Record<string, ChildSkuMapping>; frontCategoryIdRemap?: Record<string, string> } }
@@ -136,18 +140,27 @@ export interface SkuStockAdjust {
 /** 门店维度某 SKU 的库存 + 分渠道零售价(FETCH_STORE_SKU_INFO 返回项) */
 export interface StoreImportOptions {
   shopId: string | number;
-  purchaseUnitPrice?: number;
 }
 
 export interface StorePurchaseRequest {
   shopId: string | number;
   targetSpuId: string | number;
-  unitPrice?: number;
-  specs: Array<{ spec: string; saleUnit: string }>;
+  specs: string[];
+}
+
+export interface ProductListSku {
+  skuId?: string | number;
+  upcList: string[];
+}
+
+export interface ProductListPage {
+  list: Array<{ spuId: string | number; name: string; upcList: string[]; skus: ProductListSku[] }>;
+  total: number;
 }
 
 export interface StoreSkuInfo {
   storePrice?: number;
+  onlinePrice?: number;
   skuId: string | number;
   /** 门店库存(取不到为 undefined) */
   stock?: number;
@@ -197,6 +210,11 @@ export interface FrontCategoryNode {
   level: number;
   enable: number;
   children: FrontCategoryNode[];
+}
+
+export interface FrontCategoryTree {
+  categories: FrontCategoryNode[];
+  storeGroupId?: number;
 }
 
 /** 媒体上传结果(图片/视频共用) */
